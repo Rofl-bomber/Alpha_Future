@@ -1,0 +1,74 @@
+{
+ "best_single": "e001",
+ "best_single_score": 41.7879928,
+ "l1_score": 41.7879928,
+ "candidates": [
+  "e001"
+ ],
+ "choice": "e001",
+ "choice_reason": "кандидат один",
+ "final_score": 41.7879928,
+ "submission": "C:\\Projects\\Alpha_Future\\regression\\participants\\submission.csv",
+ "llm_tokens": {
+  "researcher": {
+   "calls": 10,
+   "prompt": 0,
+   "completion": 0,
+   "cached_calls": 0
+  }
+ },
+ "iterations": [
+  {
+   "iter": 1,
+   "time_s": 0.9,
+   "n_hyp": 0
+  },
+  {
+   "iter": 2,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 3,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 4,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 5,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 6,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 7,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 8,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 9,
+   "time_s": 0.3,
+   "n_hyp": 0
+  },
+  {
+   "iter": 10,
+   "time_s": 0.3,
+   "n_hyp": 0
+  }
+ ],
+ "total_time_s": 34.2,
+ "run_dir": "C:\\Projects\\Alpha_Future\\regression\\participants\\agent_runs\\20261020_211014"
+}

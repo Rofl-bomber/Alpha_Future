@@ -1,0 +1,67 @@
+Тип задачи: regression; таргет: site_eui; метрика: rmse (меньше — лучше). Признаков: 62 (категориальных 3, числовых 59).
+Строк: train 10000, test 22449.
+Таргет: mean=84.24, std=60.21, min=1.106, p50=76.57, max=975.5, skew=5.07, доля <=0: 0.000
+Важности L1 (gain, доля): facility_type=0.269, energy_star_rating=0.260, floor_area=0.128, year_built=0.101, ELEVATION=0.025, days_with_fog=0.018, building_class=0.012, january_min_temp_c=0.010, State_Factor=0.008, october_avg_temp_c=0.007, july_avg_temp_c=0.007, march_max_temp_c=0.007, january_avg_temp_c=0.006, precipitation_inches=0.006, july_min_temp_c=0.005
+Колонки (имя | тип | пропуски train/test | уникальных | статистика/примеры | описание):
+- facility_type | cat | 0.00/0.00 | 60 | примеры: Multifamily_Uncategorized, Office_Uncategorized, Education_Other_classroom, 2to4_Unit_Building | Назначение здания
+- energy_star_rating | num | 0.41/0.20 | 100 | mean=61.96 std=28.6 min=1 max=100 | Рейтинг энергоэффективности ENERGY STAR
+- floor_area | num | 0.00/0.00 | 18593 | mean=1.608e+05 std=2.404e+05 min=1800 max=6.353e+06 | Площадь здания
+- year_built | num | 0.03/0.00 | 178 | mean=1954 std=35.2 min=0 max=2015 | Год постройки; исходные нули и пропуски сохранены
+- ELEVATION | num | 0.00/0.00 | 119 | mean=44.09 std=62.2 min=1.8 max=1478 | Высота местоположения здания; единица в словаре соревнования не указана
+- days_with_fog | num | 0.63/0.57 | 38 | mean=128.9 std=53.62 min=12 max=311 | Количество дней с туманом
+- building_class | cat | 0.00/0.00 | 2 | примеры: Residential, Commercial | Класс здания: Residential или Commercial
+- january_min_temp_c | num | 0.00/0.00 | 46 | mean=-10.97 std=5.29 min=-28.33 max=9.444 | Минимальная температура в январе
+- State_Factor | cat | 0.00/0.00 | 7 | примеры: State_6, State_11, State_4, State_2 | Код штата; действительное название анонимизировано
+- october_avg_temp_c | num | 0.00/0.00 | 93 | mean=14.7 std=1.247 min=7.052 max=22.95 | Средняя температура в октябре
+- july_avg_temp_c | num | 0.00/0.00 | 92 | mean=24.59 std=2.582 min=12.68 max=30.73 | Средняя температура в июле
+- march_max_temp_c | num | 0.00/0.00 | 34 | mean=23.56 std=3.594 min=13.33 max=35 | Максимальная температура в марте
+- january_avg_temp_c | num | 0.00/0.00 | 95 | mean=1.503 std=3.676 min=-11.77 max=18.2 | Средняя температура в январе
+- precipitation_inches | num | 0.00/0.00 | 95 | mean=41.67 std=8.052 min=0 max=107.7 | Годовое количество осадков
+- july_min_temp_c | num | 0.00/0.00 | 26 | mean=15.64 std=2.369 min=2.778 max=19.44 | Минимальная температура в июле
+- june_avg_temp_c | num | 0.00/0.00 | 91 | mean=21.59 std=1.833 min=12.72 max=27.5 | Средняя температура в июне
+- july_max_temp_c | num | 0.00/0.00 | 32 | mean=34.85 std=2.433 min=18.33 max=44.44 | Максимальная температура в июле
+- september_avg_temp_c | num | 0.00/0.00 | 91 | mean=20.94 std=2.079 min=12.1 max=27.41 | Средняя температура в сентябре
+- february_max_temp_c | num | 0.00/0.00 | 37 | mean=16.09 std=3.601 min=5 max=30 | Максимальная температура в феврале
+- december_avg_temp_c | num | 0.00/0.00 | 93 | mean=3.974 std=3.33 min=-4.561 max=16.55 | Средняя температура в декабре
+- may_avg_temp_c | num | 0.00/0.00 | 90 | mean=17.02 std=1.314 min=8.306 max=23.47 | Средняя температура в мае
+- direction_max_wind_speed | num | 0.49/0.66 | 9 | mean=34.25 std=99.07 min=1 max=360 | Направление ветра при максимальной скорости; 360 — север, 180 — юг
+- snowdepth_inches | num | 0.00/0.00 | 45 | mean=118.9 std=128.6 min=0 max=1292 | Годовой показатель глубины снежного покрова; способ агрегации не уточнён
+- april_avg_temp_c | num | 0.00/0.00 | 96 | mean=12 std=1.41 min=4.6 max=19.75 | Средняя температура в апреле
+- direction_peak_wind_speed | num | 0.51/0.66 | 7 | mean=31.67 std=97.05 min=1 max=360 | Направление ветра при пиковом порыве
+- january_max_temp_c | num | 0.00/0.00 | 43 | mean=14.67 std=2.476 min=5.556 max=32.22 | Максимальная температура в январе
+- may_min_temp_c | num | 0.00/0.00 | 30 | mean=6.391 std=2.091 min=-5 max=14.44 | Минимальная температура в мае
+- snowfall_inches | num | 0.00/0.00 | 52 | mean=28.05 std=15.58 min=0 max=127.3 | Годовое количество выпавшего снега
+- august_avg_temp_c | num | 0.00/0.00 | 94 | mean=24.46 std=2.417 min=14.45 max=30.3 | Средняя температура в августе
+- november_avg_temp_c | num | 0.00/0.00 | 94 | mean=9.436 std=1.877 min=-0.6852 max=19.68 | Средняя температура в ноябре
+- days_below_minus1C | num | 0.00/0.00 | 61 | mean=46.17 std=27.61 min=0 max=170 | Количество дней с температурой ниже порога ≈ -1 °C
+- Year_Factor | num | 0.00/0.00 | 6 | mean=5.294 std=1.252 min=1 max=6 | Код года наблюдения; календарный год анонимизирован
+- november_min_temp_c | num | 0.00/0.00 | 39 | mean=-0.6626 std=3.952 min=-15.56 max=11.11 | Минимальная температура в ноябре
+- june_min_temp_c | num | 0.00/0.00 | 29 | mean=10.22 std=1.905 min=-1.111 max=17.22 | Минимальная температура в июне
+- april_min_temp_c | num | 0.00/0.00 | 35 | mean=-1.126 std=3.643 min=-9.444 max=11.11 | Минимальная температура в апреле
+- avg_temp_c | num | 0.00/0.00 | 96 | mean=13.49 std=1.09 min=6.951 max=20.82 | Средняя температура за год
+- december_max_temp_c | num | 0.00/0.00 | 33 | mean=16.19 std=3.303 min=5.556 max=29.44 | Максимальная температура в декабре
+- april_max_temp_c | num | 0.00/0.00 | 29 | mean=28.52 std=1.956 min=16.67 max=37.22 | Максимальная температура в апреле
+- march_min_temp_c | num | 0.00/0.00 | 50 | mean=-4.292 std=5.04 min=-22.78 max=11.11 | Минимальная температура в марте
+- october_min_temp_c | num | 0.00/0.00 | 32 | mean=3.211 std=2.614 min=-7.778 max=16.11 | Минимальная температура в октябре
+- days_above_27C | num | 0.00/0.00 | 77 | mean=83.81 std=28.37 min=1 max=196 | Количество дней с температурой выше порога ≈ 27 °C
+- october_max_temp_c | num | 0.00/0.00 | 35 | mean=27.65 std=3.236 min=15 max=42.22 | Максимальная температура в октябре
+- max_wind_speed | num | 0.49/0.66 | 12 | mean=2.635 std=4.919 min=1 max=23.3 | Максимальная скорость ветра; единица в словаре соревнования не указана
+- november_max_temp_c | num | 0.00/0.00 | 32 | mean=22.32 std=1.944 min=11.67 max=35.56 | Максимальная температура в ноябре
+- december_min_temp_c | num | 0.00/0.00 | 37 | mean=-7.44 std=5.738 min=-26.67 max=6.667 | Минимальная температура в декабре
+- september_min_temp_c | num | 0.00/0.00 | 30 | mean=10.52 std=2.381 min=-3.333 max=18.33 | Минимальная температура в сентябре
+- september_max_temp_c | num | 0.00/0.00 | 32 | mean=32.87 std=2.832 min=21.11 max=42.22 | Максимальная температура в сентябре
+- march_avg_temp_c | num | 0.00/0.00 | 95 | mean=8.232 std=2.938 min=-3.414 max=18.08 | Средняя температура в марте
+- february_min_temp_c | num | 0.00/0.00 | 48 | mean=-12.67 std=7.617 min=-25 max=8.889 | Минимальная температура в феврале
+- may_max_temp_c | num | 0.00/0.00 | 26 | mean=32.29 std=1.472 min=22.22 max=40 | Максимальная температура в мае
+- august_min_temp_c | num | 0.00/0.00 | 26 | mean=14.61 std=2.313 min=-0.5556 max=19.44 | Минимальная температура в августе
+- june_max_temp_c | num | 0.00/0.00 | 30 | mean=32.51 std=1.872 min=22.78 max=44.44 | Максимальная температура в июне
+- february_avg_temp_c | num | 0.00/0.00 | 94 | mean=2.958 std=4.275 min=-10.42 max=16.21 | Средняя температура в феврале
+- days_above_32C | num | 0.00/0.00 | 50 | mean=16.05 std=10.95 min=0 max=137 | Количество дней с температурой выше порога ≈ 32 °C
+- august_max_temp_c | num | 0.00/0.00 | 33 | mean=34.29 std=2.554 min=22.22 max=44.44 | Максимальная температура в августе
+- heating_degree_days_c | num | 0.00/0.00 | 96 | mean=2385 std=422.9 min=255 max=4405 | Годовая сумма недостатка средней суточной температуры относительно 18⅓ °C
+- cooling_degree_days_c | num | 0.00/0.00 | 90 | mean=671.7 std=249.6 min=2.222 max=1657 | Годовая сумма превышений средней суточной температуры над 18⅓ °C
+- days_below_minus7C | num | 0.00/0.00 | 30 | mean=15.78 std=13.54 min=0 max=93 | Количество дней с температурой ниже порога ≈ -7 °C
+- days_below_minus12C | num | 0.00/0.00 | 27 | mean=4.267 std=6.457 min=0 max=59 | Количество дней с температурой ниже порога ≈ -12 °C
+- days_above_38C | num | 0.00/0.00 | 22 | mean=0.113 std=1.21 min=0 max=45 | Количество дней с температурой выше порога ≈ 38 °C
+- days_below_minus18C | num | 0.00/0.00 | 17 | mean=1.158 std=2.494 min=0 max=31 | Количество дней с температурой ниже порога ≈ -18 °C
+- days_above_43C | num | 0.00/0.00 | 3 | mean=0.0004931 std=0.02937 min=0 max=3 | Количество дней с температурой выше порога ≈ 43 °C
