@@ -84,7 +84,7 @@ def main():
                    patch={"features.custom": ["+fe_usage_index"]}, feature_spec="usage_index из справочных данных",
                    expected="рост метрики")
     hd = h.model_dump()
-    verdict = orch._critic_jump(h, hd, res, base_e, base, fe_id, delta, rel)
+    verdict = orch._critic_jump(hd, res, base_e, base, fe_id, delta, rel)
     ok = verdict["verdict"] == "reject"
     print(f"Связь с таргетом: {verdict['assoc']}")
     print(f"Вердикт Критика: {verdict['verdict']} — {verdict['reason']}")

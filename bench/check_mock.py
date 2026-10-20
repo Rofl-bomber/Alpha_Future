@@ -1,6 +1,6 @@
 """Шаг 1 проверки: mock-LLM без эндпоинта, все ветки.
 
-    python bench/check_mock.py [--work DIR] [--iters-reg 8] [--iters-clf 3]
+    python bench/check_mock.py [--work DIR] [--iters-reg 10] [--iters-clf 3]
 
 Генерирует уменьшенные синтетические задачи, запускает solution.py с AGENT_MOCK_LLM=1
 (как на платформе — отдельным процессом с путём к task.md) и проверяет по журналам, что пройдены все ветки.
@@ -24,7 +24,10 @@ import make_synth  # noqa: E402
 
 
 def run_task(task_md: Path, iters: int) -> Path:
-    env = {**os.environ, "AGENT_MOCK_LLM": "1", "AGENT_ITERS": str(iters)}
+    # Разведка без CatBoost — быстрее; на синтетике рабочей моделью остаётся LightGBM, и признак-отношение
+    # даёт скачок, на котором проверяется Критик.
+    env = {**os.environ, "AGENT_MOCK_LLM": "1", "AGENT_ITERS": str(iters),
+           "AGENT_PHASE_MODELS": os.environ.get("AGENT_PHASE_MODELS", "lightgbm,xgboost")}
     t = task_md.parent
     before = set((t / "agent_runs").glob("*")) if (t / "agent_runs").exists() else set()
     proc = subprocess.run([sys.executable, str(ROOT / "solution.py"), str(task_md)], env=env, cwd=str(t),
@@ -88,15 +91,49 @@ def checks_for(run_dir: Path, task_dir: Path) -> dict[str, bool]:
         "submission.csv: колонки и порядок строк": list(sub.columns) == list(sample_df.columns)
                                                    and len(sub) == len(test_df)
                                                    and (sub[id_col].astype(str).values == test_df[id_col].astype(str).values).all(),
+        "фаза A: разведка моделей без LLM": sum(1 for e in J if e.get("phase") == "models" and e.get("exp_id")) >= 2,
+        "фаза B: предобработка без LLM": any(e.get("phase") == "preprocess" and e.get("exp_id") for e in J),
+        "фаза C → D: признаки, затем тюнинг": any(e.get("phase") == "features" and e.get("exp_id") for e in J)
+                                              and any(e.get("phase") == "tuning" and e.get("exp_id") for e in J),
+        "фильтр: гипотеза не из текущей фазы": any((e.get("reason") or "").startswith("не та фаза") for e in hyps),
+        "досрочный выход из фазы по плато": any(e.get("event") == "plateau" for e in J),
+        "перенос на другие семейства": any(e.get("phase") == "transfer" and e.get("exp_id") for e in J),
+        "Критик не зовётся на смену модели": all(not e.get("critic") for e in J if e.get("kind") in ("model", "postprocess")),
         "OOF и test всех экспериментов сохранены": all((run_dir / "preds" / f"{e['exp_id']}.npz").exists()
                                                       for e in J if e.get("exp_id") and e.get("score") is not None),
+    }
+
+
+def check_noise_rule() -> dict[str, bool]:
+    """Юнит-тест решения keep: порог шума и правило фолдов на заданных скорах (без обучения моделей)."""
+    sys.path.insert(0, str(ROOT))
+    from types import SimpleNamespace
+
+    from agent.config import Config
+    from agent.orchestrator import Orchestrator
+
+    o = Orchestrator.__new__(Orchestrator)
+    o.cfg = Config()
+    o.spec = SimpleNamespace(metric="rmse")
+    base = {"fold_scores": [10.0, 10.0, 10.0, 10.0, 10.0], "score": 10.0}
+
+    def dec(folds):
+        return o._decide(SimpleNamespace(fold_scores=folds, score=sum(folds) / len(folds)), base)
+
+    noisy = dec([9.9, 9.9, 9.9, 10.5, 9.7])       # дельта +0.02, на 4/5 фолдах лучше, но SE большая
+    solid = dec([9.8, 9.7, 9.9, 9.8, 9.75])       # стабильное улучшение
+    few = dec([9.0, 9.0, 10.1, 10.1, 10.1])       # дельта +0.34, но лучше только на 2/5 фолдах
+    return {
+        "порог шума отклонил положительную дельту": (not noisy["keep"]) and "в пределах шума" in (noisy["why"] or ""),
+        "стабильный прирост принят": solid["keep"],
+        "правило фолдов отклонило прирост на 2/5": (not few["keep"]) and "фолдах" in (few["why"] or ""),
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default=str(ROOT / "bench" / "mock_tasks"))
-    ap.add_argument("--iters-reg", type=int, default=8)
+    ap.add_argument("--iters-reg", type=int, default=10)
     ap.add_argument("--iters-clf", type=int, default=3)
     args = ap.parse_args()
     work = Path(args.work)
@@ -108,6 +145,9 @@ def main():
         print(f"== {name}: mock-прогон, итераций {iters}", flush=True)
         runs[name] = run_task(work / name / "task.md", iters)
     table: dict[str, dict[str, bool]] = {name: checks_for(rd, work / name) for name, rd in runs.items()}
+    unit = check_noise_rule()
+    for name in table:
+        table[name].update(unit)
     names = list(next(iter(table.values())).keys())
     print("\n| Ветка | " + " | ".join(table) + " | итог |")
     print("|---|" + "---|" * (len(table) + 1))

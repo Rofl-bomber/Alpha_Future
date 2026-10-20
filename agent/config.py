@@ -19,11 +19,20 @@ def _env(name: str, default, cast):
 @dataclass
 class Config:
     # --- цикл ---
-    n_iters: int = 10                 # AGENT_ITERS
+    n_iters: int = 10                 # AGENT_ITERS: всего LLM-итераций на фазы C (признаки) и D (тюнинг)
     max_hypotheses: int = 5           # сколько гипотез Исследователя берём за итерацию
     fail_streak_switch: int = 6       # неудач подряд в одной категории -> смена направления
     min_folds_improved: int = 3       # keep: улучшение минимум на 3 из 5 фолдов
+    noise_k: float = 1.0              # keep: средняя парная дельта по фолдам > noise_k * SE
     jump_threshold: float = 0.15      # относительный прирост, после которого зовём Критика
+
+    # --- фазы ---
+    phase_models: str = "lightgbm,xgboost,catboost"  # A: семейства для разведки (первое — L1)
+    preprocess_max: int = 4           # B: максимум автоматических вариантов предобработки
+    features_share: float = 0.7       # C: доля LLM-итераций на признаки, остальное — тюнинг
+    plateau_features: int = 3         # C: итераций подряд без keep -> переход к тюнингу
+    plateau_tuning: int = 2           # D: итераций подряд без keep -> конец тюнинга
+    transfer: bool = True             # перенос лучшей конфигурации на другие семейства перед финалом
 
     # --- данные и валидация ---
     n_folds: int = 5
@@ -66,7 +75,14 @@ _ENV = {
     "max_hypotheses": ("AGENT_MAX_HYP", int),
     "fail_streak_switch": ("AGENT_FAIL_STREAK", int),
     "min_folds_improved": ("AGENT_MIN_FOLDS", int),
+    "noise_k": ("AGENT_NOISE_K", float),
     "jump_threshold": ("AGENT_JUMP", float),
+    "phase_models": ("AGENT_PHASE_MODELS", str),
+    "preprocess_max": ("AGENT_PREPROCESS_MAX", int),
+    "features_share": ("AGENT_FEATURES_SHARE", float),
+    "plateau_features": ("AGENT_PLATEAU_FEATURES", int),
+    "plateau_tuning": ("AGENT_PLATEAU_TUNING", int),
+    "transfer": ("AGENT_TRANSFER", bool),
     "n_folds": ("AGENT_FOLDS", int),
     "seed": ("AGENT_SEED", int),
     "subsample": ("AGENT_SUBSAMPLE", int),

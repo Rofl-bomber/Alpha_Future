@@ -33,7 +33,7 @@ def _pct(a, b):
 
 def _reason_group(r: str) -> str:
     r = r or ""
-    for key in ("невалидная гипотеза", "смена направления", "использует таргет", "использует id", "повтор",
+    for key in ("невалидная гипотеза", "не та фаза", "смена направления", "использует таргет", "использует id", "повтор",
                 "невалидный патч", "неизвестн", "отклонён Критиком", "group_by", "group_cols", "target.transform"):
         if key in r:
             return key
@@ -61,7 +61,9 @@ def analyze(run_dir: Path, samples: int = 15) -> dict:
             if x.get("valid") is False:
                 e = x.get("error") or ""
                 err_kinds["JSON не извлечён" if "JSON" in e else ("схема" if "validation" in e.lower() else e[:40])] += 1
-    hyps = [e for e in J if e.get("hypothesis")]
+    hyps_all = [e for e in J if e.get("hypothesis")]
+    # Роль Исследователя оцениваем только по LLM-фазам; A, B и перенос делает харнесс без LLM.
+    hyps = [e for e in hyps_all if e.get("phase") in (None, "features", "tuning")]
     by_kind = Counter(e["kind"] for e in hyps)
     filtered = [e for e in hyps if e["status"] == "filtered"]
     executed = [e for e in hyps if e["status"] != "filtered"]
@@ -84,6 +86,15 @@ def analyze(run_dir: Path, samples: int = 15) -> dict:
     status_by_kind = defaultdict(Counter)
     for e in hyps:
         status_by_kind[e["kind"]][e["status"]] += 1
+    noise = [e for e in hyps if "в пределах шума" in (e.get("reason") or "")]
+    phases = final.get("phases") or [e for e in J if e.get("event") == "phase_end"]
+    by_phase = defaultdict(Counter)
+    for e in hyps_all:
+        by_phase[e.get("phase") or "-"][e["status"]] += 1
+    out["phases"] = {"summary": [{k: p.get(k) for k in ("phase", "time_s", "experiments", "kept", "reason",
+                                                         "best", "best_score", "iters")} for p in phases],
+                     "status_by_phase": {k: dict(v) for k, v in by_phase.items()},
+                     "discard_by_noise": len(noise)}
     out["researcher"] = {
         "calls": len(res_calls), "json_valid_first_try": first_ok, "json_valid_after_retry": retry_ok,
         "json_failed": failed, "invalid_kinds": dict(err_kinds),
@@ -165,6 +176,14 @@ def analyze(run_dir: Path, samples: int = 15) -> dict:
 def print_report(a: dict):
     r, en, c, f, cost = a["researcher"], a["engineer"], a["critic"], a["final"], a["cost"]
     print(f"# Разбор прогона {a['run_dir']}\n")
+    ph = a.get("phases") or {}
+    if ph.get("summary"):
+        print("## Фазы")
+        for p in ph["summary"]:
+            print(f"- {p['phase']}: {p['time_s']} c, экспериментов {p['experiments']}, принято {p['kept']}, "
+                  f"итераций {p.get('iters') or '-'}; выход: {p['reason']}; лучший {p['best']} {p['best_score']}")
+        print(f"- статусы по фазам: {ph['status_by_phase']}")
+        print(f"- отклонено порогом шума (дельта > 0, но ≤ k·SE): {ph['discard_by_noise']}\n")
     print("## Исследователь")
     print(f"- вызовов: {r['calls']}; валидный JSON с первой попытки: {_pct(r['json_valid_first_try'], r['calls'])}, "
           f"после повтора: {r['json_valid_after_retry']}, не удалось: {r['json_failed']}; ошибки: {r['invalid_kinds']}")

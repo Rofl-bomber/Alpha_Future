@@ -1,4 +1,15 @@
-"""Оркестратор: L1 -> цикл Исследователь/Инженер/Критик -> финал (бленд + выбор Критика) -> submission.csv."""
+"""Оркестратор по фазам, как работает DS:
+
+    A. Разведка моделей (без LLM): L1 и другие семейства с дефолтами -> рабочая модель.
+    B. Предобработка (без LLM): короткий список применимых вариантов.
+    C. Признаки (Исследователь + Инженер + Критик): модель зафиксирована.
+    D. Тюнинг (Исследователь): только параметры рабочей модели и постобработка.
+    Перенос (без LLM): лучшая конфигурация на другие семейства — для бленда.
+    Финал: бленд + выбор Критика -> submission.csv.
+
+Изменение принимается (keep), только если средняя парная разница по фолдам больше noise_k·SE
+и улучшение есть минимум на min_folds_improved фолдах.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +31,7 @@ from .llm.client import LLMClient
 from .llm.mock import MockLLM
 from .llm.roles import Critic, Engineer, Researcher, dumps
 from .metrics import improvement, relative_improvement
-from .models import MODEL_MENU
+from .models import MODEL_MENU, MODEL_NAMES
 from .pipeline import apply_patch, config_hash, default_config, diff_sections
 from .profiler import profile
 from .runner import rerun_postprocess, run_experiment
@@ -28,6 +39,27 @@ from .spec import build_spec, load_data
 from .submission import write_submission
 
 FAIL_STATUSES = ("discard", "critic_reject", "error", "engineer_failed")
+
+PHASES = {
+    "models": {"title": "A. Разведка моделей", "auto": True},
+    "preprocess": {"title": "B. Предобработка", "auto": True},
+    "features": {
+        "title": "C. Признаки", "kinds": ("feature_code", "config"), "keys": ("features.",),
+        "goal": "Улучшить метрику новыми признаками на зафиксированной модели: доменные признаки через "
+                "feature_code, готовые операции и удаление колонок через config с ключами features.*. "
+                "Модель, её параметры и предобработку не меняй — они выбраны на предыдущих фазах.",
+    },
+    "tuning": {
+        "title": "D. Тюнинг", "kinds": ("model", "postprocess"), "keys": ("model.params", "postprocess."),
+        "goal": "Подобрать параметры зафиксированной модели (model.params) и постобработку на финальном "
+                "наборе признаков. Семейство модели (model.name) и признаки не меняй.",
+    },
+    "transfer": {"title": "Перенос на другие семейства", "auto": True},
+}
+
+# Изменения, через которые в модель может попасть новая информация, — только их проверяет Критик.
+# Смена модели, её параметров или постобработки утечку таргета внести не может.
+CRITIC_SECTIONS = {"features", "preprocess", "target"}
 
 
 def _log(msg: str):
@@ -58,7 +90,9 @@ class Orchestrator:
         self.seen_hyp: set[str] = set()
         self.seen_specs: set[str] = set()
         self.n_exp = 0
+        self.it = 0                       # сквозной номер LLM-итерации
         self.iter_stats: list[dict] = []
+        self.phase_stats: list[dict] = []
 
     # ================================================================== запуск
     def run(self) -> dict:
@@ -72,19 +106,33 @@ class Orchestrator:
         self.folds = make_folds(spec, self.data.y, cfg.n_folds, cfg.seed)
         _log(f"Данные: train {self.data.n_train}, test {self.data.n_test}, признаков {len(spec.feature_cols)}; "
              f"фолды {self.folds.scheme}")
+        families = [m.strip() for m in cfg.phase_models.split(",") if m.strip() in MODEL_NAMES] or ["lightgbm"]
 
-        # ---------------- L1: LightGBM с дефолтами, без LLM
-        l1_cfg = default_config(spec)
+        # ---------------- A. Разведка моделей (первое семейство — L1)
+        t = self._phase_start("models")
+        l1_cfg = apply_patch(default_config(spec), {"model.name": families[0]})
         res = self._run(l1_cfg)
         if not res.ok:
             raise RuntimeError(f"L1 упал: {res.error}")
         self.tried_configs.add(config_hash(l1_cfg))
         self.l1_importances = {k: v for k, v in (res.importances or {}).items() if k in spec.feature_cols}
         self.prof.set_importances(self.l1_importances)
-        self.journal.add(None, res, "baseline", iter=0)
+        self.journal.add({"id": "L1", "uid": "A_L1", "kind": "model", "phase": "models",
+                          "rationale": f"L1: {families[0]} с параметрами по умолчанию", "patch": {}},
+                         res, "baseline", iter=0, phase="models")
         write_submission(res.test, spec, self.data)
         (self.run_dir / "profile.txt").write_text(self.prof.summary(), encoding="utf-8")
-        _log(f"L1 {res.exp_id}: score={_fmt(res.score)} фолды={res.fold_scores} ({res.time_s} c); submission записан")
+        _log(f"L1 {res.exp_id} {families[0]}: score={_fmt(res.score)} фолды={res.fold_scores} ({res.time_s} c); "
+             "submission записан")
+        for fam in families[1:]:
+            self._auto("models", "model", {"model.name": fam}, f"разведка: {fam} с параметрами по умолчанию")
+        self._phase_end("models", t)
+
+        # ---------------- B. Предобработка
+        t = self._phase_start("preprocess")
+        for patch, why in self._preprocess_candidates():
+            self._auto("preprocess", "config", patch, why)
+        self._phase_end("preprocess", t)
 
         # ---------------- LLM-роли
         mock = MockLLM() if cfg.mock_llm else None
@@ -94,63 +142,165 @@ class Orchestrator:
         self.engineer = Engineer(self.client, cfg.max_new_cols)
         self.critic = Critic(self.client)
 
-        # ---------------- цикл
-        for it in range(1, cfg.n_iters + 1):
-            self._iteration(it)
+        # ---------------- C. Признаки и D. Тюнинг: общий бюджет AGENT_ITERS
+        n_c = min(cfg.n_iters, max(1, round(cfg.n_iters * cfg.features_share))) if cfg.n_iters > 0 else 0
+        used = self._llm_phase("features", n_c, cfg.plateau_features)
+        self._llm_phase("tuning", cfg.n_iters - used, cfg.plateau_tuning)
+
+        # ---------------- Перенос лучшей конфигурации на другие семейства
+        if cfg.transfer:
+            t = self._phase_start("transfer")
+            best_model = self.journal.best()["config"]["model"]["name"]
+            for fam in families:
+                if fam != best_model:
+                    self._auto("transfer", "model", {"model.name": fam},
+                               f"перенос лучших признаков и предобработки на {fam}")
+            self._phase_end("transfer", t)
 
         # ---------------- финал
         final = self._final()
         final["llm_tokens"] = self.llm_log.tokens
         final["iterations"] = self.iter_stats
+        final["phases"] = self.phase_stats
         final["total_time_s"] = round(time.time() - self.t0, 1)
         final["run_dir"] = str(self.run_dir)
         (self.run_dir / "final.json").write_text(json.dumps(final, ensure_ascii=False, indent=1, default=str))
         return final
 
+    # ================================================================== фазы
+    def _phase_start(self, phase: str) -> float:
+        b = self.journal.best()
+        _log(f"=== Фаза {PHASES[phase]['title']}" + (f" (лучший {b['exp_id']} {_fmt(b['score'])})" if b else ""))
+        self.journal.add(None, None, "event", event="phase_start", phase=phase)
+        return time.time()
+
+    def _phase_end(self, phase: str, t0: float, reason: str = "бюджет фазы исчерпан", iters: int | None = None):
+        b = self.journal.best()
+        n = sum(1 for e in self.journal.entries if e.get("phase") == phase and e.get("exp_id"))
+        kept = sum(1 for e in self.journal.entries if e.get("phase") == phase and e["status"] == "keep")
+        st = {"phase": phase, "time_s": round(time.time() - t0, 1), "experiments": n, "kept": kept,
+              "reason": reason, "best": b["exp_id"], "best_score": b["score"], "iters": iters}
+        self.phase_stats.append(st)
+        self.journal.add(None, None, "event", event="phase_end", **st)
+        _log(f"=== Фаза {PHASES[phase]['title']} завершена ({reason}): экспериментов {n}, принято {kept}, "
+             f"лучший {b['exp_id']} {_fmt(b['score'])}, {st['time_s']:.0f} c")
+
+    def _preprocess_candidates(self) -> list[tuple[dict, str]]:
+        """Короткий список применимых вариантов предобработки (по профилю данных, без знания задачи)."""
+        spec, data = self.spec, self.data
+        Xtr = data.X.iloc[: data.n_train]
+        out: list[tuple[dict, str]] = []
+        if Xtr.isna().any().any():
+            out.append(({"preprocess.missing_flags": True}, "в данных есть пропуски — флаги пропусков"))
+        if spec.cat_cols:
+            out.append(({"preprocess.cat_encoding": "target"}, "OOF target encoding вместо категорий"))
+            rare = 20
+            if any((Xtr[c].value_counts() < rare).any() for c in spec.cat_cols):
+                out.append(({"preprocess.rare_min_count": rare}, f"есть категории реже {rare} в train — объединение"))
+        if not spec.is_clf:
+            y = pd.Series(data.y)
+            if y.min() > -1 and y.skew() > 1:
+                out.append(({"target.transform": "log1p"}, f"скошенный таргет (skew={y.skew():.2f}) — log1p"))
+        return out[: self.cfg.preprocess_max]
+
+    def _llm_phase(self, phase: str, max_iters: int, plateau: int) -> int:
+        """LLM-фаза: до max_iters итераций; досрочный выход по плато или когда все категории запрещены."""
+        if max_iters <= 0:
+            return 0
+        t = self._phase_start(phase)
+        allowed = PHASES[phase]["kinds"]
+        self.streak = {k: 0 for k in self.streak}
+        no_keep, used, reason = 0, 0, "бюджет фазы исчерпан"
+        for k in range(1, max_iters + 1):
+            banned = [x for x in allowed if self.streak.get(x, 0) >= self.cfg.fail_streak_switch]
+            if banned:
+                for x in banned:
+                    self.streak[x] = 0
+                if set(banned) >= set(allowed):
+                    reason = "все категории фазы исчерпаны"
+                    break
+                self.journal.add(None, None, "event", event="direction_switch", kinds=banned, iter=self.it + 1,
+                                 phase=phase)
+                _log(f"Смена направления: запрещены категории {banned}")
+            n_keep = self._iteration(phase, k, max_iters, banned)
+            used += 1
+            no_keep = 0 if n_keep else no_keep + 1
+            if no_keep >= plateau and k < max_iters:
+                reason = f"плато: {no_keep} итерации подряд без улучшений"
+                self.journal.add(None, None, "event", event="plateau", phase=phase, iter=self.it)
+                break
+        self._phase_end(phase, t, reason, iters=used)
+        return used
+
     # ================================================================== итерация
-    def _iteration(self, it: int):
+    def _iteration(self, phase: str, k: int, max_k: int, banned: list[str]) -> int:
         cfg = self.cfg
+        self.it += 1
+        it = self.it
         t_it = time.time()
         tok_before = json.loads(json.dumps(self.llm_log.tokens))
-        banned = [k for k, s in self.streak.items() if s >= cfg.fail_streak_switch]
-        if banned:
-            for k in banned:
-                self.streak[k] = 0
-            self.journal.add(None, None, "event", event="direction_switch", kinds=banned, iter=it)
-            _log(f"Итерация {it}: смена направления, запрещены категории {banned}")
         best_e = self.journal.best()
-        ctx = self._researcher_ctx(it, banned, best_e)
+        ctx = self._researcher_ctx(phase, k, max_k, banned, best_e)
         out = self.researcher.propose(ctx)
         if not out:
-            _log(f"Итерация {it}: Исследователь не вернул валидных гипотез")
-            self.journal.add(None, None, "event", event="researcher_failed", iter=it)
-            self.iter_stats.append({"iter": it, "time_s": round(time.time() - t_it, 1), "n_hyp": 0})
-            return
+            _log(f"Итерация {it} ({PHASES[phase]['title']} {k}/{max_k}): Исследователь не вернул валидных гипотез")
+            self.journal.add(None, None, "event", event="researcher_failed", iter=it, phase=phase)
+            self.iter_stats.append({"iter": it, "phase": phase, "time_s": round(time.time() - t_it, 1), "n_hyp": 0})
+            return 0
         hyps, invalid = out
         for bad in invalid:
             raw = bad["raw"] if isinstance(bad["raw"], dict) else {"raw": bad["raw"]}
-            self.journal.add({**raw, "kind": raw.get("kind")}, None, "filtered",
-                             reason=f"невалидная гипотеза: {bad['error'][:300]}", iter=it)
+            self.journal.add({**raw, "kind": raw.get("kind"), "phase": phase}, None, "filtered",
+                             reason=f"невалидная гипотеза: {bad['error'][:300]}", iter=it, phase=phase)
         hyps = hyps[: cfg.max_hypotheses]
-        _log(f"Итерация {it}: {len(hyps)} гипотез: " + ", ".join(f"{h.id}:{h.kind}" for h in hyps))
+        _log(f"Итерация {it} ({PHASES[phase]['title']} {k}/{max_k}): {len(hyps)} гипотез: "
+             + ", ".join(f"{h.id}:{h.kind}" for h in hyps))
+        n_keep = 0
         for j, h in enumerate(hyps):
-            self._process(h, it, j, banned)
+            n_keep += int(self._process(h, phase, it, j, banned))
         tok_after = self.llm_log.tokens
         d_tok = {r: {"prompt": v["prompt"] - tok_before.get(r, {}).get("prompt", 0),
                      "completion": v["completion"] - tok_before.get(r, {}).get("completion", 0)}
                  for r, v in tok_after.items()}
         b = self.journal.best()
-        self.iter_stats.append({"iter": it, "time_s": round(time.time() - t_it, 1), "n_hyp": len(hyps),
-                                "tokens": d_tok, "best": b["exp_id"], "best_score": b["score"]})
-        _log(f"Итерация {it} завершена за {time.time() - t_it:.0f} c; лучший {b['exp_id']} score={_fmt(b['score'])}")
+        self.iter_stats.append({"iter": it, "phase": phase, "time_s": round(time.time() - t_it, 1),
+                                "n_hyp": len(hyps), "kept": n_keep, "tokens": d_tok, "best": b["exp_id"],
+                                "best_score": b["score"]})
+        _log(f"Итерация {it} завершена за {time.time() - t_it:.0f} c; принято {n_keep}; "
+             f"лучший {b['exp_id']} score={_fmt(b['score'])}")
+        return n_keep
 
-    def _researcher_ctx(self, it: int, banned: list[str], best_e: dict) -> dict:
+    def _phase_menu(self, phase: str, best_cfg: dict) -> str:
+        spec = self.spec
+        if phase == "features":
+            return "\n".join([
+                f"Модель зафиксирована: {best_cfg['model']['name']}; предобработка выбрана: "
+                f"{json.dumps(best_cfg['preprocess'], ensure_ascii=False)}, target={best_cfg['target']['transform']}.",
+                "- kind=feature_code: новый признак по feature_spec; патч {\"features.custom\": [\"+fe_<имя>\"]}",
+                "- features.builtin: freq_enc (частоты категорий на train+test), target_enc (OOF target encoding "
+                "в дополнение к категориям), group_stats (mean/std/отклонение числовых признаков внутри категорий; "
+                "features.group_by — категориальные колонки, features.group_cols — числовые; иначе по важности)",
+                "- features.drop: удалить исходные колонки или fe_XXX",
+                "- features.custom: включить или выключить уже зарегистрированные fe_XXX",
+            ])
+        name = best_cfg["model"]["name"]
+        pp = ("- postprocess.class_weights_opt: true/false — множители вероятностей классов под macro F1"
+              if spec.is_clf else "- postprocess.clip_to_train_range: true/false — клиппинг в диапазон train")
+        return "\n".join([
+            f"Модель зафиксирована: {name}. Параметры по умолчанию: {MODEL_MENU.get(name, '-')}.",
+            f"Текущие явные параметры: {json.dumps(best_cfg['model']['params'], ensure_ascii=False)}.",
+            "- model.params: словарь параметров или ключи вида model.params.<имя>; model.name не меняй",
+            pp,
+        ])
+
+    def _researcher_ctx(self, phase: str, k: int, max_k: int, banned: list[str], best_e: dict) -> dict:
         spec, cfg = self.spec, self.cfg
+        ph = PHASES[phase]
         switch_note = ""
         if banned:
             switch_note = ("СМЕНА НАПРАВЛЕНИЯ: последние гипотезы категорий " + ", ".join(banned)
                            + f" ({cfg.fail_streak_switch}+ неудач подряд) не дали улучшения. В этой итерации НЕ "
-                             "предлагай гипотезы этих категорий — переключись на другие.")
+                             "предлагай гипотезы этих категорий — переключись на другие разрешённые.")
         notes = (" Примечания: " + "; ".join(spec.notes)) if spec.notes else ""
         prompt = dict(
             task_brief=spec.brief() + notes,
@@ -159,20 +309,31 @@ class Orchestrator:
             best_id=best_e["exp_id"], best_score=_fmt(best_e["score"]),
             best_config=json.dumps(best_e["config"], ensure_ascii=False),
             journal=self.journal.summary(10),
-            models="\n".join(f"- {k}: {v}" for k, v in MODEL_MENU.items()),
+            phase_title=ph["title"], phase_goal=ph["goal"],
+            phase_kinds=", ".join(ph["kinds"]), phase_keys=", ".join(f"{x}*" for x in ph["keys"]),
+            phase_menu=self._phase_menu(phase, best_e["config"]),
             features=self.registry.menu(),
-            iteration=it, n_iters=cfg.n_iters, remaining=cfg.n_iters - it,
+            phase_iter=k, phase_max=max_k, noise_k=_fmt(cfg.noise_k, 3), min_folds=cfg.min_folds_improved,
+            n_folds=cfg.n_folds,
             switch_note=switch_note or "Ограничений по категориям нет.",
             n_hyp=f"от 3 до {cfg.max_hypotheses}",
         )
-        mock = dict(iteration=it, n_iters=cfg.n_iters, banned_kinds=banned, top_num=self.prof.top_numeric(5),
-                    top_cat=self.prof.top_categorical(3), target=spec.target, id_col=spec.id_col,
-                    task_type=spec.task_type, n_hyp=cfg.max_hypotheses)
+        mock = dict(phase=phase, phase_iter=k, iteration=self.it, n_iters=cfg.n_iters, banned_kinds=banned,
+                    top_num=self.prof.top_numeric(5), top_cat=self.prof.top_categorical(3), target=spec.target,
+                    id_col=spec.id_col, task_type=spec.task_type, n_hyp=cfg.max_hypotheses,
+                    model_name=best_e["config"]["model"]["name"])
         return {"prompt": prompt, "mock": mock}
 
     # ================================================================== гипотеза
-    def _filter(self, h, banned: list[str]) -> str | None:
+    def _filter(self, h, banned: list[str], phase: str, current_model: str) -> str | None:
         spec = self.spec
+        ph = PHASES[phase]
+        if h.kind not in ph["kinds"]:
+            return f"не та фаза: в фазе «{ph['title']}» разрешены {', '.join(ph['kinds'])}"
+        bad = [k for k in h.patch if not str(k).startswith(ph["keys"])
+               and not (k == "model.name" and h.patch[k] == current_model)]
+        if bad:
+            return f"не та фаза: ключи {bad} не разрешены в фазе «{ph['title']}»"
         if h.kind in banned:
             return f"смена направления: категория {h.kind} в этой итерации запрещена"
         text = json.dumps(h.patch, ensure_ascii=False) + " " + (h.feature_spec or "")
@@ -231,21 +392,19 @@ class Orchestrator:
             return "target.transform применим только к регрессии"
         return None
 
-    def _process(self, h, it: int, j: int, banned: list[str]):
-        cfg, spec = self.cfg, self.spec
+    def _process(self, h, phase: str, it: int, j: int, banned: list[str]) -> bool:
         hd = h.model_dump()
         hd["uid"] = f"i{it}_{j + 1}_{h.id or 'h'}"
-        reason = self._filter(h, banned)
-        if reason:
-            self.journal.add(hd, None, "filtered", reason=reason, iter=it)
-            _log(f"  {hd['uid']} [{h.kind}] отфильтрована: {reason}")
-            return
+        hd["phase"] = phase
         best_e = self.journal.best()
-        best_res = self.journal.result(best_e["exp_id"])
-        base_cfg = best_e["config"]
-        patch = dict(h.patch)
+        current_model = best_e["config"]["model"]["name"]
+        reason = self._filter(h, banned, phase, current_model)
+        if reason:
+            self.journal.add(hd, None, "filtered", reason=reason, iter=it, phase=phase)
+            _log(f"  {hd['uid']} [{h.kind}] отфильтрована: {reason}")
+            return False
+        patch = {k: v for k, v in h.patch.items() if k != "model.name"}  # совпадающее имя модели — не изменение
         fe_id, alias, eng_log = None, None, None
-
         if h.kind == "feature_code":
             custom = patch.get("features.custom", [])
             custom = custom if isinstance(custom, list) else [custom]
@@ -254,66 +413,103 @@ class Orchestrator:
             fe_id, err, eng_log = self._engineer(h, alias, hd["uid"])
             if fe_id is None:
                 self._fail(h.kind)
-                self.journal.add(hd, None, "engineer_failed", reason=err, engineer=eng_log, iter=it)
+                self.journal.add(hd, None, "engineer_failed", reason=err, engineer=eng_log, iter=it, phase=phase)
                 _log(f"  {hd['uid']} [feature_code] Инженер не справился: {' '.join(str(err).split())[-160:]}")
-                return
+                return False
             if not unknown:  # имя не указано или совпало с уже зарегистрированным — добавляем новый признак явно
                 patch["features.custom"] = list(custom) + [f"+{alias}"]
         patch = self._resolve_patch(patch, alias, fe_id)
+        return self._evaluate(hd, h.kind, patch, phase, it, fe_id=fe_id, eng_log=eng_log)
+
+    def _auto(self, phase: str, kind: str, patch: dict, rationale: str) -> bool:
+        """Гипотеза без LLM (фазы A, B и перенос)."""
+        n = sum(1 for e in self.journal.entries if e.get("phase") == phase and e.get("hypothesis"))
+        hd = {"id": f"{phase}_{n + 1}", "uid": f"{phase[0].upper()}_{n + 1}", "kind": kind, "phase": phase,
+              "rationale": rationale, "patch": patch, "feature_spec": None, "expected": "", "cost": "auto"}
+        return self._evaluate(hd, kind, patch, phase, self.it)
+
+    def _decide(self, res, base_e: dict) -> dict:
+        """keep, если средняя парная разница по фолдам > noise_k·SE и улучшение минимум на min_folds фолдах."""
+        cfg, metric = self.cfg, self.spec.metric
+        d = np.array([improvement(metric, a, b) for a, b in zip(res.fold_scores, base_e["fold_scores"])])
+        delta = float(d.mean())
+        se = float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else 0.0
+        t = delta / se if se > 0 else (float("inf") if delta > 0 else 0.0)
+        folds_better = int((d > 0).sum())
+        if delta <= 0:
+            why = "хуже или равно базе"
+        elif folds_better < cfg.min_folds_improved:
+            why = f"лучше только на {folds_better}/{len(d)} фолдах"
+        elif delta <= cfg.noise_k * se:
+            why = f"в пределах шума: дельта {delta:.4g} ≤ {cfg.noise_k:g}·SE {se:.4g}"
+        else:
+            why = None
+        return {"keep": why is None, "why": why, "delta": delta, "se": se, "t": t, "folds_better": folds_better,
+                "rel": relative_improvement(metric, res.score, base_e["score"])}
+
+    def _evaluate(self, hd: dict, kind: str, patch: dict, phase: str, it: int, fe_id=None, eng_log=None) -> bool:
+        spec, cfg = self.spec, self.cfg
+        best_e = self.journal.best()
+        best_res = self.journal.result(best_e["exp_id"])
+        base_cfg = best_e["config"]
         try:
             cfg_new = apply_patch(base_cfg, patch)
         except Exception as e:
-            self.journal.add(hd, None, "filtered", reason=f"невалидный патч: {str(e)[:300]}", iter=it, feature=fe_id)
-            _log(f"  {hd['uid']} [{h.kind}] невалидный патч: {str(e)[:120]}")
-            return
+            self.journal.add(hd, None, "filtered", reason=f"невалидный патч: {str(e)[:300]}", iter=it, phase=phase,
+                             feature=fe_id)
+            _log(f"  {hd['uid']} [{kind}] невалидный патч: {str(e)[:120]}")
+            return False
         sem = self._semantic_check(cfg_new)
         if sem:
-            self.journal.add(hd, None, "filtered", reason=sem, iter=it, feature=fe_id)
-            _log(f"  {hd['uid']} [{h.kind}] отфильтрована: {sem}")
-            return
+            self.journal.add(hd, None, "filtered", reason=sem, iter=it, phase=phase, feature=fe_id)
+            _log(f"  {hd['uid']} [{kind}] отфильтрована: {sem}")
+            return False
         chash = config_hash(cfg_new)
         if chash in self.tried_configs:
             self.journal.add(hd, None, "filtered", reason="повтор: такая конфигурация уже проверялась", iter=it,
-                             feature=fe_id)
-            _log(f"  {hd['uid']} [{h.kind}] отфильтрована: повтор конфигурации")
-            return
+                             phase=phase, feature=fe_id)
+            _log(f"  {hd['uid']} [{kind}] отфильтрована: повтор конфигурации")
+            return False
         self.tried_configs.add(chash)
 
-        if diff_sections(cfg_new, base_cfg) == {"postprocess"} and best_res is not None:
+        changed = diff_sections(cfg_new, base_cfg)
+        if changed == {"postprocess"} and best_res is not None:
             self.n_exp += 1
             res = rerun_postprocess(best_res, cfg_new, spec, self.folds, self.data, exp_id=f"e{self.n_exp:03d}")
         else:
             res = self._run(cfg_new)
 
-        extra = dict(iter=it, base_exp=best_e["exp_id"], feature=fe_id, engineer=eng_log, applied_patch=patch)
+        extra = dict(iter=it, phase=phase, base_exp=best_e["exp_id"], feature=fe_id, engineer=eng_log,
+                     applied_patch=patch)
         if not res.ok:
-            self._fail(h.kind)
+            self._fail(kind)
             self.journal.add(hd, res, "error", reason=str(res.error).splitlines()[0][:300], **extra)
-            _log(f"  {hd['uid']} [{h.kind}] {res.exp_id} ошибка: {str(res.error).splitlines()[0][:150]}")
-            return
+            _log(f"  {hd['uid']} [{kind}] {res.exp_id} ошибка: {str(res.error).splitlines()[0][:150]}")
+            return False
 
-        delta = improvement(spec.metric, res.score, best_e["score"])
-        rel = relative_improvement(spec.metric, res.score, best_e["score"])
-        folds_better = int(sum(improvement(spec.metric, a, b) > 0
-                               for a, b in zip(res.fold_scores, best_e["fold_scores"])))
-        keep = delta > 0 and folds_better >= cfg.min_folds_improved
-        status, critic = ("keep" if keep else "discard"), None
-        if keep and rel > cfg.jump_threshold:
-            critic = self._critic_jump(h, hd, res, best_e, best_res, fe_id, delta, rel)
+        dec = self._decide(res, best_e)
+        status, critic = ("keep" if dec["keep"] else "discard"), None
+        if dec["keep"] and dec["rel"] > cfg.jump_threshold and changed & CRITIC_SECTIONS:
+            critic = self._critic_jump(hd, res, best_e, best_res, fe_id, dec["delta"], dec["rel"])
             if critic["verdict"] != "accept":
                 status = "critic_reject"
         if fe_id:
             self.registry.meta[fe_id]["status"] = status
-        self.journal.add(hd, res, status, delta=round(float(delta), 8), rel_delta=round(float(rel), 6),
-                         folds_improved=folds_better, critic=critic, **extra)
+        self.journal.add(hd, res, status, delta=round(dec["delta"], 8), rel_delta=round(dec["rel"], 6),
+                         se=round(dec["se"], 8), t_stat=round(dec["t"], 3) if np.isfinite(dec["t"]) else None,
+                         folds_improved=dec["folds_better"], reason=dec["why"], critic=critic, **extra)
         mark = {"keep": "KEEP", "discard": "discard", "critic_reject": "REJECT(критик)"}[status]
-        _log(f"  {hd['uid']} [{h.kind}] {res.exp_id} {res.config['model']['name']}: score={_fmt(res.score)} "
-             f"дельта={delta:+.5g} ({rel:+.1%}) фолдов лучше {folds_better}/{len(self.folds)} -> {mark} ({res.time_s} c)")
+        t_txt = f"t={dec['t']:.1f}" if np.isfinite(dec["t"]) else "t=inf"
+        _log(f"  {hd['uid']} [{kind}] {res.exp_id} {res.config['model']['name']}: score={_fmt(res.score)} "
+             f"дельта={dec['delta']:+.5g} ({dec['rel']:+.1%}, {t_txt}) фолдов лучше {dec['folds_better']}/"
+             f"{len(self.folds)} -> {mark}" + (f" [{dec['why']}]" if dec["why"] and dec["delta"] > 0 else "")
+             + f" ({res.time_s} c)")
         if status == "keep":
-            self.streak[h.kind] = 0
+            self.streak[kind] = 0
             write_submission(res.test, spec, self.data)
-        else:
-            self._fail(h.kind)
+            return True
+        self._fail(kind)
+        return False
 
     def _fail(self, kind: str):
         self.streak[kind] = self.streak.get(kind, 0) + 1
@@ -391,7 +587,7 @@ class Orchestrator:
                 out[c] = round(float(abs(np.corrcoef(v[m], y[m])[0, 1])), 4)
         return out, ("eta (корреляционное отношение с классом)" if spec.is_clf else "|corr| Пирсона с таргетом")
 
-    def _critic_jump(self, h, hd, res, best_e, best_res, fe_id, delta, rel) -> dict:
+    def _critic_jump(self, hd, res, best_e, best_res, fe_id, delta, rel) -> dict:
         assoc, kind = self._new_columns_assoc(res, best_res)
         nums = [v for v in assoc.values() if isinstance(v, (int, float))]
         max_abs = max(nums) if nums else None
