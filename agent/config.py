@@ -22,7 +22,8 @@ class Config:
     n_iters: int = 10                 # AGENT_ITERS
     max_hypotheses: int = 5           # сколько гипотез Исследователя берём за итерацию
     fail_streak_switch: int = 6       # неудач подряд в одной категории -> смена направления
-    min_folds_improved: int = 3       # keep: улучшение минимум на 3 из 5 фолдов
+    t_min: float = 2.0                # keep: средняя парная дельта по фолдам > 0 и t >= t_min
+    t_noise: float = 1.0              # 1 <= t < t_min -> статус noise («на грани шума»)
     jump_threshold: float = 0.15      # относительный прирост, после которого зовём Критика
 
     # --- данные и валидация ---
@@ -30,6 +31,13 @@ class Config:
     seed: int = 42
     subsample: int = 0                # AGENT_SUBSAMPLE: >0 -> берём столько строк train
     threads: int = 8                  # AGENT_THREADS: 0 -> os.cpu_count()
+    split_unseen: float = 0.95        # доля новых значений в test, с которой колонка считается колонкой сплита
+    dup_min: float = 0.05             # доля дубликатов train, с которой фолды группируются по хэшу строки
+    adv_rows: int = 50000             # максимум строк с каждой стороны для adversarial validation
+    es_frac: float = 0.1              # доля обучающей части фолда под early stopping
+
+    # --- анализ ошибок ---
+    err_chars: int = 3500             # лимит сводки анализа ошибок для Исследователя
 
     # --- Инженер и песочница ---
     engineer_max_fixes: int = 2
@@ -65,12 +73,18 @@ _ENV = {
     "n_iters": ("AGENT_ITERS", int),
     "max_hypotheses": ("AGENT_MAX_HYP", int),
     "fail_streak_switch": ("AGENT_FAIL_STREAK", int),
-    "min_folds_improved": ("AGENT_MIN_FOLDS", int),
+    "t_min": ("AGENT_T_MIN", float),
+    "t_noise": ("AGENT_T_NOISE", float),
     "jump_threshold": ("AGENT_JUMP", float),
     "n_folds": ("AGENT_FOLDS", int),
     "seed": ("AGENT_SEED", int),
     "subsample": ("AGENT_SUBSAMPLE", int),
     "threads": ("AGENT_THREADS", int),
+    "split_unseen": ("AGENT_SPLIT_UNSEEN", float),
+    "dup_min": ("AGENT_DUP_MIN", float),
+    "adv_rows": ("AGENT_ADV_ROWS", int),
+    "es_frac": ("AGENT_ES_FRAC", float),
+    "err_chars": ("AGENT_ERR_CHARS", int),
     "engineer_max_fixes": ("AGENT_ENGINEER_FIXES", int),
     "sandbox_timeout": ("AGENT_SANDBOX_TIMEOUT", int),
     "max_new_cols": ("AGENT_MAX_NEW_COLS", int),

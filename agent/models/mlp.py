@@ -103,6 +103,23 @@ class MLPModel(ModelBase):
     name = "mlp"
     kind = "mlp"
     defaults = dict(lr=1e-3, weight_decay=1e-5, batch_size=512, max_epochs=100, patience=8)
+    param_schema = {
+        "lr": ("float", 1e-5, 0.1),
+        "weight_decay": ("float", 0.0, 0.1),
+        "batch_size": ("int", 32, 8192),
+        "max_epochs": ("int", 1, 500),
+        "patience": ("int", 1, 50),
+        "hidden": ("int", 16, 2048),
+        "n_layers": ("int", 1, 8),
+        "dropout": ("float", 0.0, 0.9),
+    }
+    param_aliases = {
+        "learning_rate": "lr", "epochs": "max_epochs", "n_epochs": "max_epochs", "num_epochs": "max_epochs",
+        "hidden_size": "hidden", "hidden_dim": "hidden", "units": "hidden", "d_main": "hidden",
+        "num_layers": "n_layers", "layers": "n_layers", "depth": "n_layers",
+        "early_stopping_rounds": "patience", "wd": "weight_decay",
+    }
+    doc_defaults = {"hidden": 256, "n_layers": 2, "dropout": 0.1}
 
     def fit(self, X_tr, y_tr, X_va, y_va, cat_cols):
         import torch

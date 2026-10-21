@@ -7,6 +7,9 @@ $task_excerpt
 # Профиль данных
 $profile
 
+# Анализ ошибок текущего лучшего
+$errors
+
 # Текущая лучшая конфигурация ($best_id, score=$best_score)
 $best_config
 

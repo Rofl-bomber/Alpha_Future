@@ -1,7 +1,17 @@
-"""Оркестратор: L1 -> цикл Исследователь/Инженер/Критик -> финал (бленд + выбор Критика) -> submission.csv."""
+"""Оркестратор: профиль сдвига -> фолды -> L1 -> цикл Исследователь/Инженер/Критик -> финал
+(бленд + выбор Критика) -> submission.csv.
+
+Доработки по ТЗ:
+- блок 1: схема фолдов по профилю сдвига (shift.detect_shift, cv.make_folds), скор «вперёд» для L1;
+- блок 2: keep/discard по t-критерию парных разниц по фолдам, статус noise;
+- блок 3: проверка параметров моделей по схеме до запуска эксперимента;
+- блок 4: честная оценка (early stopping на внутреннем сплите, cross-fit постобработки и бленда) — в runner/ensemble;
+- блок 5: анализ ошибок текущего лучшего, target_segment и segment_delta.
+"""
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import time
@@ -11,23 +21,25 @@ import numpy as np
 import pandas as pd
 
 from .config import Config
-from .cv import make_folds
+from .cv import forward_split, make_folds
 from .ensemble import blend
+from .errors import analyze_errors, segment_score
 from .features.builtin import build_feature_frame
 from .features.sandbox import FeatureRegistry, run_make_features
 from .journal import Journal, LLMLog
 from .llm.client import LLMClient
 from .llm.mock import MockLLM
 from .llm.roles import Critic, Engineer, Researcher, dumps
-from .metrics import improvement, relative_improvement
-from .models import MODEL_MENU
+from .metrics import improvement, paired_test, relative_improvement
+from .models import model_menu, validate_params
 from .pipeline import apply_patch, config_hash, default_config, diff_sections
 from .profiler import profile
 from .runner import rerun_postprocess, run_experiment
+from .shift import detect_shift
 from .spec import build_spec, load_data
 from .submission import write_submission
 
-FAIL_STATUSES = ("discard", "critic_reject", "error", "engineer_failed")
+FAIL_STATUSES = ("discard", "noise", "critic_reject", "error", "engineer_failed")
 
 
 def _log(msg: str):
@@ -59,6 +71,10 @@ class Orchestrator:
         self.seen_specs: set[str] = set()
         self.n_exp = 0
         self.iter_stats: list[dict] = []
+        self.shift = None
+        self.err_report = None
+        self.l1_importances: dict = {}
+        self._menu: dict | None = None
 
     # ================================================================== запуск
     def run(self) -> dict:
@@ -68,10 +84,17 @@ class Orchestrator:
         (self.run_dir / "agent_config.json").write_text(json.dumps(cfg.__dict__, ensure_ascii=False, indent=1, default=str))
 
         self.data = load_data(spec, cfg.subsample, cfg.seed)
-        self.prof = profile(spec, self.data, cfg.profile_max_chars)
-        self.folds = make_folds(spec, self.data.y, cfg.n_folds, cfg.seed)
+
+        # ---------------- профиль сдвига и схема фолдов (блок 1)
+        self.shift = detect_shift(spec, self.data, cfg)
+        self.folds = make_folds(spec, self.data, self.shift, cfg.n_folds, cfg.seed)
+        self.shift.cv_desc = self.folds.scheme
+        self.shift.save(self.run_dir / "shift.json")
+        self.prof = profile(spec, self.data, cfg.profile_max_chars, shift=self.shift)
         _log(f"Данные: train {self.data.n_train}, test {self.data.n_test}, признаков {len(spec.feature_cols)}; "
-             f"фолды {self.folds.scheme}")
+             f"фолды: {self.folds.scheme}")
+        _log(f"Сдвиг ({self.shift.time_s} c): колонка сплита {self.shift.split_col or '-'}, "
+             f"adversarial AUC {_fmt(self.shift.adv_auc, 3)}, дубликаты train {self.shift.dup_share_train:.1%}")
 
         # ---------------- L1: LightGBM с дефолтами, без LLM
         l1_cfg = default_config(spec)
@@ -81,10 +104,13 @@ class Orchestrator:
         self.tried_configs.add(config_hash(l1_cfg))
         self.l1_importances = {k: v for k, v in (res.importances or {}).items() if k in spec.feature_cols}
         self.prof.set_importances(self.l1_importances)
-        self.journal.add(None, res, "baseline", iter=0)
+        fw = self._forward_score(l1_cfg)
+        self.journal.add(None, res, "baseline", iter=0, **fw)
         write_submission(res.test, spec, self.data)
+        self._update_errors(res)
         (self.run_dir / "profile.txt").write_text(self.prof.summary(), encoding="utf-8")
-        _log(f"L1 {res.exp_id}: score={_fmt(res.score)} фолды={res.fold_scores} ({res.time_s} c); submission записан")
+        _log(f"L1 {res.exp_id}: score={_fmt(res.score)} фолды={res.fold_scores} ({res.time_s} c)"
+             + (f"; вперёд {_fmt(fw.get('forward_score'))}" if fw else "") + "; submission записан")
 
         # ---------------- LLM-роли
         mock = MockLLM() if cfg.mock_llm else None
@@ -106,6 +132,34 @@ class Orchestrator:
         final["run_dir"] = str(self.run_dir)
         (self.run_dir / "final.json").write_text(json.dumps(final, ensure_ascii=False, indent=1, default=str))
         return final
+
+    def _forward_score(self, l1_cfg: dict) -> dict:
+        """Скор «вперёд» для сплита типа time — только для сверки, в keep/discard не участвует (ТЗ 1.5)."""
+        fw = forward_split(self.spec, self.data, self.shift)
+        if fw is None:
+            return {}
+        cfg_fw = copy.deepcopy(l1_cfg)
+        cfg_fw["postprocess"]["class_weights_opt"] = False  # один фолд: cross-fit постобработки невозможен
+        r = run_experiment(cfg_fw, self.spec, fw, self.data, registry=self.registry, importances=None,
+                           n_threads=self.cfg.n_threads, seed=self.cfg.seed, exp_id="forward",
+                           es_frac=self.cfg.es_frac)
+        if not r.ok:
+            return {"forward_scheme": fw.scheme, "forward_error": str(r.error).splitlines()[0][:300]}
+        return {"forward_scheme": fw.scheme, "forward_score": r.score}
+
+    def _update_errors(self, res):
+        """Анализ ошибок текущего лучшего (блок 5): пересчитывается только при новом лучшем."""
+        try:
+            rep = analyze_errors(self.spec, self.data, self.folds, res, self.shift, self.l1_importances)
+            rep.save(self.run_dir / "errors" / f"{res.exp_id}.json")
+            self.err_report = rep
+        except Exception as e:  # анализ ошибок не должен ронять прогон
+            _log(f"Анализ ошибок для {res.exp_id} не построен: {type(e).__name__}: {e}")
+
+    def _models_menu(self) -> dict:
+        if self._menu is None:
+            self._menu = model_menu(self.spec)
+        return self._menu
 
     # ================================================================== итерация
     def _iteration(self, it: int):
@@ -152,14 +206,16 @@ class Orchestrator:
                            + f" ({cfg.fail_streak_switch}+ неудач подряд) не дали улучшения. В этой итерации НЕ "
                              "предлагай гипотезы этих категорий — переключись на другие.")
         notes = (" Примечания: " + "; ".join(spec.notes)) if spec.notes else ""
+        errors = self.err_report.summary(cfg.err_chars) if self.err_report is not None else "Анализ ошибок недоступен."
         prompt = dict(
             task_brief=spec.brief() + notes,
             task_excerpt=spec.task_text[:1500],
             profile=self.prof.summary(with_brief=False),
+            errors=errors,
             best_id=best_e["exp_id"], best_score=_fmt(best_e["score"]),
             best_config=json.dumps(best_e["config"], ensure_ascii=False),
             journal=self.journal.summary(10),
-            models="\n".join(f"- {k}: {v}" for k, v in MODEL_MENU.items()),
+            models="\n".join(f"- {k}: {v}" for k, v in self._models_menu().items()),
             features=self.registry.menu(),
             iteration=it, n_iters=cfg.n_iters, remaining=cfg.n_iters - it,
             switch_note=switch_note or "Ограничений по категориям нет.",
@@ -167,7 +223,8 @@ class Orchestrator:
         )
         mock = dict(iteration=it, n_iters=cfg.n_iters, banned_kinds=banned, top_num=self.prof.top_numeric(5),
                     top_cat=self.prof.top_categorical(3), target=spec.target, id_col=spec.id_col,
-                    task_type=spec.task_type, n_hyp=cfg.max_hypotheses)
+                    task_type=spec.task_type, n_hyp=cfg.max_hypotheses,
+                    segments=self.err_report.segment_ids()[:5] if self.err_report is not None else [])
         return {"prompt": prompt, "mock": mock}
 
     # ================================================================== гипотеза
@@ -231,6 +288,33 @@ class Orchestrator:
             return "target.transform применим только к регрессии"
         return None
 
+    def _check_params(self, cfg_new: dict) -> tuple[str | None, list[str]]:
+        """Блок 3: параметры модели по схеме. Алиасы заменяются, ошибки — фильтр гипотезы."""
+        m = cfg_new["model"]
+        canon, errors, fixes = validate_params(m["name"], m.get("params") or {}, self.spec)
+        if errors:
+            return "; ".join(errors)[:600], fixes
+        m["params"] = canon
+        return None, fixes
+
+    def _segment_delta(self, seg: str | None, base_res, res) -> dict:
+        """Блок 5: изменение метрики сегмента, на который нацелена гипотеза."""
+        if not seg:
+            return {}
+        if self.err_report is None or not self.err_report.has(seg):
+            return {"target_segment": seg, "segment_warning": "id сегмента не найден в анализе ошибок"}
+        try:
+            a = segment_score(seg, self.spec, self.data, self.folds, self.shift, base_res.oof)
+            b = segment_score(seg, self.spec, self.data, self.folds, self.shift, res.oof)
+        except Exception as e:
+            return {"target_segment": seg, "segment_warning": f"не посчитан: {type(e).__name__}: {e}"}
+        if a is None or b is None:
+            return {"target_segment": seg, "segment_warning": "сегмент пуст или не распознан"}
+        (va, gib), (vb, _) = a, b
+        d = (vb - va) if gib else (va - vb)
+        return {"target_segment": seg, "segment_base": round(float(va), 6), "segment_new": round(float(vb), 6),
+                "segment_delta": round(float(d), 6)}
+
     def _process(self, h, it: int, j: int, banned: list[str]):
         cfg, spec = self.cfg, self.spec
         hd = h.model_dump()
@@ -266,15 +350,21 @@ class Orchestrator:
             self.journal.add(hd, None, "filtered", reason=f"невалидный патч: {str(e)[:300]}", iter=it, feature=fe_id)
             _log(f"  {hd['uid']} [{h.kind}] невалидный патч: {str(e)[:120]}")
             return
+        perr, pfixes = self._check_params(cfg_new)
+        if perr:
+            self.journal.add(hd, None, "filtered", reason=f"параметры модели: {perr}", iter=it, feature=fe_id,
+                             param_fixes=pfixes)
+            _log(f"  {hd['uid']} [{h.kind}] отфильтрована: {perr[:150]}")
+            return
         sem = self._semantic_check(cfg_new)
         if sem:
-            self.journal.add(hd, None, "filtered", reason=sem, iter=it, feature=fe_id)
+            self.journal.add(hd, None, "filtered", reason=sem, iter=it, feature=fe_id, param_fixes=pfixes)
             _log(f"  {hd['uid']} [{h.kind}] отфильтрована: {sem}")
             return
         chash = config_hash(cfg_new)
         if chash in self.tried_configs:
             self.journal.add(hd, None, "filtered", reason="повтор: такая конфигурация уже проверялась", iter=it,
-                             feature=fe_id)
+                             feature=fe_id, param_fixes=pfixes)
             _log(f"  {hd['uid']} [{h.kind}] отфильтрована: повтор конфигурации")
             return
         self.tried_configs.add(chash)
@@ -285,33 +375,45 @@ class Orchestrator:
         else:
             res = self._run(cfg_new)
 
-        extra = dict(iter=it, base_exp=best_e["exp_id"], feature=fe_id, engineer=eng_log, applied_patch=patch)
+        extra = dict(iter=it, base_exp=best_e["exp_id"], feature=fe_id, engineer=eng_log, applied_patch=patch,
+                     param_fixes=pfixes)
         if not res.ok:
             self._fail(h.kind)
             self.journal.add(hd, res, "error", reason=str(res.error).splitlines()[0][:300], **extra)
             _log(f"  {hd['uid']} [{h.kind}] {res.exp_id} ошибка: {str(res.error).splitlines()[0][:150]}")
             return
 
+        # ---------------- keep / noise / discard по t-критерию (блок 2)
         delta = improvement(spec.metric, res.score, best_e["score"])
         rel = relative_improvement(spec.metric, res.score, best_e["score"])
-        folds_better = int(sum(improvement(spec.metric, a, b) > 0
-                               for a, b in zip(res.fold_scores, best_e["fold_scores"])))
-        keep = delta > 0 and folds_better >= cfg.min_folds_improved
-        status, critic = ("keep" if keep else "discard"), None
-        if keep and rel > cfg.jump_threshold:
+        pt = paired_test(spec.metric, res.fold_scores, best_e["fold_scores"])
+        mean, t = pt["mean"], pt["t"]
+        if mean > 0 and (t is None or t >= cfg.t_min):
+            status = "keep"
+        elif mean > 0 and t is not None and t >= cfg.t_noise:
+            status = "noise"
+        else:
+            status = "discard"
+        critic = None
+        if status == "keep" and rel > cfg.jump_threshold:
             critic = self._critic_jump(h, hd, res, best_e, best_res, fe_id, delta, rel)
             if critic["verdict"] != "accept":
                 status = "critic_reject"
+        seg = self._segment_delta(h.target_segment, best_res, res) if best_res is not None else {}
         if fe_id:
             self.registry.meta[fe_id]["status"] = status
         self.journal.add(hd, res, status, delta=round(float(delta), 8), rel_delta=round(float(rel), 6),
-                         folds_improved=folds_better, critic=critic, **extra)
-        mark = {"keep": "KEEP", "discard": "discard", "critic_reject": "REJECT(критик)"}[status]
+                         t=(round(float(t), 3) if t is not None else None), se=round(float(pt["se"]), 8),
+                         fold_deltas=pt["deltas"], critic=critic, **seg, **extra)
+        mark = {"keep": "KEEP", "noise": "noise", "discard": "discard", "critic_reject": "REJECT(критик)"}[status]
+        seg_txt = (f"; сегмент {seg['target_segment']} {seg['segment_delta']:+.4g}"
+                   if "segment_delta" in seg else "")
         _log(f"  {hd['uid']} [{h.kind}] {res.exp_id} {res.config['model']['name']}: score={_fmt(res.score)} "
-             f"дельта={delta:+.5g} ({rel:+.1%}) фолдов лучше {folds_better}/{len(self.folds)} -> {mark} ({res.time_s} c)")
+             f"дельта={delta:+.5g} ({rel:+.1%}) t={_fmt(t, 3)} -> {mark}{seg_txt} ({res.time_s} c)")
         if status == "keep":
             self.streak[h.kind] = 0
             write_submission(res.test, spec, self.data)
+            self._update_errors(res)
         else:
             self._fail(h.kind)
 
@@ -321,16 +423,24 @@ class Orchestrator:
     def _run(self, config: dict):
         self.n_exp += 1
         return run_experiment(config, self.spec, self.folds, self.data, registry=self.registry,
-                              importances=getattr(self, "l1_importances", None), n_threads=self.cfg.n_threads,
-                              seed=self.cfg.seed, exp_id=f"e{self.n_exp:03d}")
+                              importances=self.l1_importances or None, n_threads=self.cfg.n_threads,
+                              seed=self.cfg.seed, exp_id=f"e{self.n_exp:03d}", es_frac=self.cfg.es_frac)
 
     # ================================================================== Инженер
     def _columns_text(self) -> str:
         rows = []
         for c in self.prof.columns:
             rows.append(f"- {c.name} | {'категориальная (str)' if c.kind == 'cat' else 'числовая (float)'} | "
-                        f"{c.missing_train:.2f} | {', '.join(c.examples[:4])} | {(c.description or '')[:100]}")
+                        f"{c.missing_train:.2f} | {', '.join(c.examples[:4]) or self._num_example(c)} | "
+                        f"{(c.description or '')[:100]}")
         return "\n".join(rows)
+
+    @staticmethod
+    def _num_example(c) -> str:
+        st = c.stats_train or {}
+        if st.get("min") is None or (isinstance(st.get("min"), float) and np.isnan(st["min"])):
+            return "-"
+        return f"{st['min']:.4g}..{st['max']:.4g}"
 
     def _engineer(self, h, alias: str, uid: str):
         cfg = self.cfg
@@ -429,18 +539,28 @@ class Orchestrator:
                 break
         best_single = cands[0]
         results = [self.journal.result(e["exp_id"]) for e in cands]
+        l1 = next(e for e in self.journal.entries if e["status"] == "baseline")
         out = {"best_single": best_single["exp_id"], "best_single_score": best_single["score"],
-               "l1_score": next(e["score"] for e in self.journal.entries if e["status"] == "baseline"),
+               "best_single_score_insample": best_single.get("score_insample"),
+               "l1_score": l1["score"], "l1_score_insample": l1.get("score_insample"),
+               "l1_forward_score": l1.get("forward_score"),
+               "cv_scheme": self.folds.scheme,
                "candidates": [e["exp_id"] for e in cands]}
         br = None
         if len(results) >= 2:
             br = blend(results, spec, self.data, self.folds, default_config(spec)["postprocess"])
-            out.update(blend_score=br.score, blend_weights=dict(zip(br.members, br.weights)),
-                       blend_folds=br.fold_scores)
+            out.update(blend_score=br.score, blend_score_insample=br.score_insample,
+                       blend_weights=dict(zip(br.members, br.weights)), blend_folds=br.fold_scores,
+                       blend_fold_weights=br.fold_weights)
+            if br.score_insample is not None:
+                out["blend_insample_minus_cv"] = br.score_insample - br.score
             np.savez_compressed(self.run_dir / "preds" / "blend.npz", oof=br.oof, test=br.test,
                                 oof_raw=br.oof_raw, test_raw=br.test_raw)
+        if best_single.get("score_insample") is not None:
+            out["best_single_insample_minus_cv"] = best_single["score_insample"] - best_single["score"]
         _log("Финал: кандидаты " + ", ".join(f"{e['exp_id']}({e['model']}, {_fmt(e['score'])})" for e in cands)
-             + (f"; бленд {_fmt(br.score)} веса {dict(zip(br.members, br.weights))}" if br else ""))
+             + (f"; бленд {_fmt(br.score)} (in-sample {_fmt(br.score_insample)}) "
+                f"веса {dict(zip(br.members, br.weights))}" if br else ""))
 
         choice, reason = best_single["exp_id"], "кандидат один"
         if br is not None:
@@ -460,7 +580,7 @@ class Orchestrator:
             else:
                 better = improvement(spec.metric, br.score, best_single["score"]) > 0
                 choice = "blend" if better else best_single["exp_id"]
-                reason = "Критик не дал валидного выбора — взят лучший по OOF"
+                reason = "Критик не дал валидного выбора — взят лучший по cross-fit OOF"
             _log(f"Критик (финал): {choice} — {reason[:150]}")
         if choice == "blend":
             preds, final_score = br.test, br.score

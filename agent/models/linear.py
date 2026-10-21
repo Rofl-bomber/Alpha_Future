@@ -44,6 +44,19 @@ class _LinearPrep:
 class LinearModel(ModelBase):
     name = "linear"
     defaults = dict()
+    uses_eval = False
+    param_schema = {
+        "alpha": ("float", 1e-6, 1e4),
+        "C": ("float", 1e-4, 1e4),
+        "max_iter": ("int", 100, 10000),
+        "class_weight": ("choice", ["balanced", None]),
+        "max_levels": ("int", 1, 200),
+    }
+    param_aliases = {"reg_lambda": "alpha", "lambda": "alpha", "l2": "alpha", "c": "C",
+                     "max_categories": "max_levels"}
+    clf_only = {"C", "max_iter", "class_weight"}
+    reg_only = {"alpha"}
+    doc_defaults = {"alpha": 1.0, "C": 1.0, "max_iter": 2000, "max_levels": 30}
 
     def fit(self, X_tr, y_tr, X_va, y_va, cat_cols):
         p = dict(self.params)

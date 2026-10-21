@@ -26,6 +26,7 @@ from agent.metrics import improvement, relative_improvement  # noqa: E402
 from agent.orchestrator import Orchestrator  # noqa: E402
 from agent.pipeline import apply_patch, default_config  # noqa: E402
 from agent.profiler import profile  # noqa: E402
+from agent.shift import detect_shift  # noqa: E402
 from agent.spec import load_data  # noqa: E402
 
 LEAK_CODE = '''import numpy as np
@@ -51,8 +52,10 @@ def main():
     orch = Orchestrator(a.task_md, cfg)
     spec = orch.spec
     orch.data = load_data(spec, cfg.subsample, cfg.seed)
-    orch.prof = profile(spec, orch.data, cfg.profile_max_chars)
-    orch.folds = make_folds(spec, orch.data.y, cfg.n_folds, cfg.seed)
+    orch.shift = detect_shift(spec, orch.data, cfg)
+    orch.folds = make_folds(spec, orch.data, orch.shift, cfg.n_folds, cfg.seed)
+    orch.shift.cv_desc = orch.folds.scheme
+    orch.prof = profile(spec, orch.data, cfg.profile_max_chars, shift=orch.shift)
     base = orch._run(default_config(spec))
     orch.l1_importances = {k: v for k, v in (base.importances or {}).items() if k in spec.feature_cols}
     base_e = orch.journal.add(None, base, "baseline", iter=0)

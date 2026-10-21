@@ -32,11 +32,21 @@ class Hypothesis(BaseModel):
     feature_spec: str | None = None
     expected: str = ""
     cost: str = "low"
+    target_segment: str | None = None   # id сегмента из анализа ошибок, который гипотеза должна улучшить
 
     @field_validator("id", "rationale", "expected", "cost", mode="before")
     @classmethod
     def _str(cls, v):
         return "" if v is None else str(v)
+
+    @field_validator("target_segment", mode="before")
+    @classmethod
+    def _seg(cls, v):
+        # мягкая валидация: любое значение приводится к строке; неизвестный id не отклоняет гипотезу
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
 
     @model_validator(mode="after")
     def _check(self):

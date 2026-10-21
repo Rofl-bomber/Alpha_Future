@@ -1,4 +1,4 @@
-"""Реестр моделей раннера. Импорт ленивый: torch грузится только для mlp/resnet."""
+"""Реестр моделей раннера. Импорт ленивый: torch грузится только при обучении mlp/resnet."""
 
 from __future__ import annotations
 
@@ -16,22 +16,42 @@ _REGISTRY = {
 
 MODEL_NAMES = tuple(_REGISTRY)
 
-# Подсказка Исследователю: основные параметры каждой модели и их значения по умолчанию.
-MODEL_MENU = {
-    "lightgbm": "learning_rate=0.05, num_leaves=63, min_child_samples=20, subsample=0.8, colsample_bytree=0.8, "
-                "reg_lambda=1, n_estimators=3000 (early stopping 100), objective (напр. huber, regression_l1), class_weight",
-    "catboost": "learning_rate=0.08, depth=6, l2_leaf_reg=3, iterations=2000 (early stopping 100), auto_class_weights",
-    "xgboost": "learning_rate=0.05, max_depth=7, subsample=0.8, colsample_bytree=0.8, min_child_weight=1, reg_lambda=1",
-    "extratrees": "n_estimators=300, min_samples_leaf=3, max_features=0.5, class_weight",
-    "linear": "Ridge(alpha=1) / LogisticRegression(C=1, class_weight); one-hot топ-30 уровней категорий (max_levels)",
-    "mlp": "hidden=256, n_layers=2, dropout=0.1, lr=1e-3, weight_decay=1e-5, batch_size=512, max_epochs=100, patience=8",
-    "resnet": "d_main=192, n_blocks=3, d_hidden_factor=2, dropout=0.15, lr=1e-3, weight_decay=1e-5, batch_size=512",
+_NOTES = {
+    "lightgbm": "early stopping по внутреннему сплиту; alpha — параметр objective=huber",
+    "catboost": "early stopping по внутреннему сплиту",
+    "xgboost": "early stopping по внутреннему сплиту; huber_slope — параметр reg:pseudohubererror",
+    "extratrees": "без early stopping",
+    "linear": "Ridge для регрессии, LogisticRegression для классификации; one-hot топ-уровней категорий",
+    "mlp": "quantile transform, эмбеддинги категорий, early stopping по эпохам",
+    "resnet": "ResNet-MLP, остальное как у mlp",
 }
 
 
-def get_model(name: str, params: dict, spec, n_threads: int, seed: int):
+def get_model_class(name: str):
     if name not in _REGISTRY:
-        raise ValueError(f"неизвестная модель {name}")
+        raise ValueError(f"неизвестная модель {name}; доступные: {', '.join(MODEL_NAMES)}")
     mod_name, cls_name = _REGISTRY[name]
     mod = importlib.import_module(f"{__name__}.{mod_name}")
-    return getattr(mod, cls_name)(params, spec, n_threads=n_threads, seed=seed)
+    return getattr(mod, cls_name)
+
+
+def get_model(name: str, params: dict, spec, n_threads: int, seed: int):
+    return get_model_class(name)(params, spec, n_threads=n_threads, seed=seed)
+
+
+def validate_params(name: str, params: dict | None, spec) -> tuple[dict, list[str], list[str]]:
+    """(канонические параметры, ошибки, исправления) по схеме модели. Ошибка — гипотеза отфильтровывается."""
+    try:
+        cls = get_model_class(name)
+    except ValueError as e:
+        return {}, [str(e)], []
+    return cls.validate(params, spec)
+
+
+def model_menu(spec) -> dict[str, str]:
+    """Меню для Исследователя, сгенерированное из param_schema: ровно те имена, что пройдут проверку."""
+    out = {}
+    for name in MODEL_NAMES:
+        cls = get_model_class(name)
+        out[name] = f"{cls.menu(spec)}. {_NOTES.get(name, '')}".strip()
+    return out

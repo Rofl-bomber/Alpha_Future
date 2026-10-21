@@ -38,3 +38,14 @@ def improvement(metric: str, new: float, base: float) -> float:
 
 def relative_improvement(metric: str, new: float, base: float) -> float:
     return improvement(metric, new, base) / max(abs(base), 1e-12)
+
+
+def paired_test(metric: str, new_folds: list[float], base_folds: list[float]) -> dict:
+    """Парные разницы по фолдам (ТЗ, блок 2). d_k = improvement(new_k, base_k), положительное — лучше.
+    Возвращает mean, se = std(d, ddof=1)/sqrt(K), t = mean/se (None при se = 0) и сами разницы."""
+    d = np.array([improvement(metric, a, b) for a, b in zip(new_folds, base_folds)], dtype=float)
+    k = len(d)
+    mean = float(d.mean()) if k else 0.0
+    se = float(d.std(ddof=1) / np.sqrt(k)) if k > 1 else 0.0
+    t = (mean / se) if se > 1e-15 else None
+    return {"mean": mean, "se": se, "t": t, "deltas": [round(float(x), 8) for x in d]}

@@ -11,6 +11,22 @@ import numpy as np
 
 KEPT = ("baseline", "keep")
 FAILED = ("discard", "critic_reject", "engineer_failed", "error", "filtered")
+NOISE = ("noise",)   # выигрыш есть, но в пределах шума по фолдам (1 <= t < t_min): не «провал», а слабый сигнал
+
+
+def _fmt_t(e: dict) -> str:
+    t = e.get("t")
+    if t is None:
+        return "-" if e.get("se") is None else "se=0"
+    return f"{t:.1f}"
+
+
+def _fmt_seg(e: dict) -> str:
+    seg = e.get("target_segment")
+    if not seg:
+        return "-"
+    sd = e.get("segment_delta")
+    return f"{seg} {sd:+.4g}" if isinstance(sd, (int, float)) else f"{seg} ?"
 
 
 def _short(obj, n=160) -> str:
@@ -40,7 +56,8 @@ class Journal:
             e.update({
                 "exp_id": result.exp_id, "model": result.config["model"]["name"],
                 "config": result.config, "fold_scores": result.fold_scores, "score": result.score,
-                "raw_score": result.raw_score, "oof_score": result.oof_score, "pp_params": result.pp_params,
+                "raw_score": result.raw_score, "oof_score": result.oof_score,
+                "score_insample": getattr(result, "score_insample", None), "pp_params": result.pp_params,
                 "time_s": result.time_s, "error": result.error, "reused_from": result.reused_from,
                 "n_features": len(result.feature_names),
             })
@@ -87,13 +104,25 @@ class Journal:
                          + (f" (L1 {base['score']:.6g})" if base and base.get("score") is not None else ""))
         top = self.ranked()[:k]
         if top:
-            lines.append(f"Топ-{len(top)} экспериментов (exp_id | тип | модель | статус | score | дельта | идея):")
+            lines.append(f"Топ-{len(top)} экспериментов (exp_id | тип | модель | статус | score | дельта | t | "
+                         f"сегмент | идея):")
             for e in top:
                 h = e.get("hypothesis") or {}
                 d = e.get("delta")
                 lines.append(f"- {e['exp_id']} | {e.get('kind') or 'L1'} | {e.get('model')} | {e['status']} | "
-                             f"{e['score']:.6g} | {('%+.4g' % d) if d is not None else '-'} | "
-                             f"{_short(h.get('rationale', ''), 90)} | patch={_short(e.get('patch') or {}, 120)}")
+                             f"{e['score']:.6g} | {('%+.4g' % d) if d is not None else '-'} | {_fmt_t(e)} | "
+                             f"{_fmt_seg(e)} | {_short(h.get('rationale', ''), 90)} | "
+                             f"patch={_short(e.get('patch') or {}, 120)}")
+        noise = [e for e in self.entries if e["status"] in NOISE][-8:]
+        if noise:
+            lines.append("На грани шума (выигрыш есть, но t ниже порога; идею можно усилить или совместить с другой):")
+            for e in noise:
+                h = e.get("hypothesis") or {}
+                what = h.get("feature_spec") or e.get("patch")
+                d = e.get("delta")
+                lines.append(f"- {e.get('exp_id')} [{e.get('kind')}] {_short(what, 120)}"
+                             + (f" (дельта {d:+.4g}, t {_fmt_t(e)})" if d is not None else "")
+                             + (f"; сегмент {_fmt_seg(e)}" if e.get("target_segment") else ""))
         failed = [e for e in self.entries if e["status"] in FAILED][-15:]
         if failed:
             lines.append("Неудачные идеи (не повторять):")
@@ -103,7 +132,9 @@ class Journal:
                 reason = e.get("reason") or ""
                 d = e.get("delta")
                 lines.append(f"- [{e.get('kind')}] {_short(what, 120)} -> {e['status']}"
-                             + (f" (дельта {d:+.4g})" if d is not None else "") + (f": {_short(reason, 100)}" if reason else ""))
+                             + (f" (дельта {d:+.4g}, t {_fmt_t(e)})" if d is not None else "")
+                             + (f"; сегмент {_fmt_seg(e)}" if e.get("target_segment") else "")
+                             + (f": {_short(reason, 100)}" if reason else ""))
         errs = [e for e in self.entries if e.get("error")][-3:]
         if errs:
             lines.append("Последние ошибки:")

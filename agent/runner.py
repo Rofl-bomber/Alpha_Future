@@ -1,4 +1,10 @@
-"""run_experiment: конфигурация -> 5 фолдов -> скоры, OOF, предсказания test, время, ошибка."""
+"""run_experiment: конфигурация -> фолды -> скоры, OOF, предсказания test, время, ошибка.
+
+Честная оценка (ТЗ, блок 4):
+- early stopping идёт по внутреннему сплиту обучающей части фолда (cv.inner_split),
+  внешний валидационный фолд модель не видит;
+- постобработка с подбором параметров — cross-fit (postprocess.postprocess_cv).
+"""
 
 from __future__ import annotations
 
@@ -10,10 +16,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .cv import inner_split
 from .features.builtin import build_feature_frame, target_encode
 from .metrics import score as metric_score
 from .models import get_model
-from .postprocess import postprocess
+from .postprocess import postprocess_cv
 
 
 @dataclass
@@ -21,12 +28,13 @@ class ExpResult:
     exp_id: str
     config: dict
     fold_scores: list[float] = field(default_factory=list)
-    score: float | None = None            # среднее по фолдам после постобработки
-    oof_score: float | None = None        # по всему OOF
+    score: float | None = None            # среднее по фолдам после cross-fit постобработки
+    oof_score: float | None = None        # по всему OOF (cross-fit)
     raw_score: float | None = None        # среднее по фолдам до постобработки
+    score_insample: float | None = None   # постобработка подобрана на всём OOF — только для диагностики
     oof_raw: np.ndarray | None = None     # в исходной шкале таргета, до постобработки
     test_raw: np.ndarray | None = None
-    oof: np.ndarray | None = None         # после постобработки
+    oof: np.ndarray | None = None         # после cross-fit постобработки
     test: np.ndarray | None = None
     pp_params: dict = field(default_factory=dict)
     time_s: float = 0.0
@@ -71,7 +79,7 @@ def _fold_scores(spec, y, pred, folds) -> list[float]:
 
 
 def run_experiment(config: dict, spec, folds, data, registry=None, importances: dict | None = None,
-                   n_threads: int = 1, seed: int = 42, exp_id: str = "") -> ExpResult:
+                   n_threads: int = 1, seed: int = 42, exp_id: str = "", es_frac: float = 0.1) -> ExpResult:
     t0 = time.time()
     res = ExpResult(exp_id=exp_id, config=config)
     try:
@@ -89,7 +97,7 @@ def run_experiment(config: dict, spec, folds, data, registry=None, importances: 
         test = np.zeros((len(X_te_full), k)) if spec.is_clf else np.zeros(len(X_te_full))
         imps: dict[str, float] = {}
         mcfg = config["model"]
-        for tr, va in folds:
+        for fold_k, (tr, va) in enumerate(folds):
             X_tr, X_va, X_te = X.iloc[tr], X.iloc[va], X_te_full
             cats = list(ff.cat_cols)
             if ff.te_cols:
@@ -107,7 +115,13 @@ def run_experiment(config: dict, spec, folds, data, registry=None, importances: 
             X_tr, X_va, X_te = (d.rename(columns=ren) for d in (X_tr, X_va, X_te))
             cats_safe = [ren[c] for c in cats]
             model = get_model(mcfg["name"], mcfg["params"], spec, n_threads=n_threads, seed=seed)
-            model.fit(X_tr, y_fit[tr], X_va, y_fit[va], cats_safe)
+            y_tr = y_fit[tr]
+            if getattr(model, "uses_eval", True):
+                # early stopping по внутреннему сплиту обучающей части: внешний фолд va модель не видит
+                p_fit, p_es = inner_split(tr, y, folds, es_frac, seed + fold_k, spec.is_clf)
+                model.fit(X_tr.iloc[p_fit], y_tr[p_fit], X_tr.iloc[p_es], y_tr[p_es], cats_safe)
+            else:
+                model.fit(X_tr, y_tr, X_tr.iloc[:0], y_tr[:0], cats_safe)
             p_va = model.predict(X_va)
             p_te = model.predict(X_te)
             if tt:
@@ -133,14 +147,24 @@ def run_experiment(config: dict, spec, folds, data, registry=None, importances: 
     return res
 
 
+def _covered(folds, n: int) -> np.ndarray:
+    m = np.zeros(n, dtype=bool)
+    for _, va in folds:
+        m[va] = True
+    return m
+
+
 def _finish(res: ExpResult, spec, folds, data):
     y = data.y
     y_range = (float(np.min(y)), float(np.max(y))) if not spec.is_clf else (0.0, 0.0)
-    oof, test, params = postprocess(spec, res.config["postprocess"], y, res.oof_raw, res.test_raw, y_range)
+    oof, test, params, oof_in = postprocess_cv(spec, res.config["postprocess"], y, res.oof_raw, res.test_raw,
+                                               y_range, folds)
     res.oof, res.test, res.pp_params = oof, test, params
     res.fold_scores = [round(float(s), 6) for s in _fold_scores(spec, y, oof, folds)]
     res.score = float(np.mean(res.fold_scores))
-    res.oof_score = float(metric_score(spec.metric, y, oof, spec.n_classes or None))
+    res.score_insample = float(np.mean(_fold_scores(spec, y, oof_in, folds)))
+    cov = _covered(folds, len(y))
+    res.oof_score = float(metric_score(spec.metric, y[cov], oof[cov], spec.n_classes or None))
 
 
 def rerun_postprocess(base: ExpResult, config: dict, spec, folds, data, exp_id: str = "") -> ExpResult:
