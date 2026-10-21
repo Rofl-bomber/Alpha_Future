@@ -51,7 +51,7 @@ class Journal:
                          + f": {_short(r.get('desc'))}" + (f" — ошибка: {_short(r.get('error'), 120)}"
                                                            if r.get('error') else ""))
         failed = [r for r in self.records if r.get("status") in ("rejected", "screen_rejected", "failed",
-                                                                  "flagged")][-k_failed:]
+                                                                  "flagged", "invalid")][-k_failed:]
         if failed:
             lines.append("Не сработало (не повторять в том же виде):")
             for r in failed:

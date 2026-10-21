@@ -35,7 +35,10 @@ def main():
     else:
         index = {str(c): i for i, c in enumerate(spec.classes)}
         yt = m[f"{t}_true"].astype(str).map(index).to_numpy()
-        yp = m[f"{t}_pred"].astype(str).map(index).to_numpy()
+        if metric.need == "proba":
+            yp = m[f"{t}_pred"].to_numpy(float)
+        else:
+            yp = m[f"{t}_pred"].astype(str).map(index).to_numpy()
         value = metric.fn(yt, yp)
     print(f"{spec.metric} = {value:.6g} (строк {len(m)} из {len(ans)})")
     if a.baseline is not None:

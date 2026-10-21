@@ -25,7 +25,7 @@ RANGES = {
 
 def space(trial) -> dict:
     return {
-        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.2, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 0.04, 0.2, log=True),
         "depth": trial.suggest_int("depth", 4, 9),
         "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.5, 30.0, log=True),
         "random_strength": trial.suggest_float("random_strength", 0.1, 5.0, log=True),

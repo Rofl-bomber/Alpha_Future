@@ -73,6 +73,8 @@ class Orchestrator:
         self.l1 = None
         self.hints = {}
         self.segments = []
+        self.research_empty = 0
+        self.research_skip = 0
 
     # ================================================================== точка входа
     def run(self) -> dict:
@@ -357,8 +359,20 @@ class Orchestrator:
                 else:
                     hyp = self._next_hypothesis()
                     if hyp is None:
-                        log.info("гипотезы закончились")
-                        break
+                        # гипотез нет: новая ветка другого семейства, затем Optuna лучшего узла, иначе — финал
+                        best = self.pop.best() or self.l1
+                        if restart:
+                            desc, patch = restart[0]
+                            self.tried_sigs.add(self._sig({"kind": "restart", "patch": patch}))
+                            self._evaluate_hypothesis({"kind": "restart", "block": "model", "patch": patch,
+                                                       "rationale": desc, "source": "scheduler"})
+                        elif best.id not in self.scheduler.tuned:
+                            self.scheduler.tuned.add(best.id)
+                            self._op_tune(best)
+                        else:
+                            log.info("гипотезы закончились")
+                            break
+                        continue
                     self._evaluate_hypothesis(hyp)
             except Exception as e:  # noqa: BLE001
                 log.exception("ошибка в операторе %s: %s", action.kind, e)
@@ -379,6 +393,9 @@ class Orchestrator:
 
     def _start_research(self):
         if self.research_future is not None or not self.llm or not self.llm.available or not self.llm.budget_left():
+            return
+        if self.research_skip > 0:  # Исследователь дважды подряд не дал нового — пропускаем пару раундов
+            self.research_skip -= 1
             return
         parent = self.pop.best() or self.l1
         ctx = self._research_context(parent)
@@ -413,6 +430,9 @@ class Orchestrator:
                 self.queue.append(h)
                 added += 1
         log.info("[%s] новых гипотез от Исследователя: %d", self.timer.stamp(), added)
+        self.research_empty = 0 if added else self.research_empty + 1
+        if self.research_empty >= 2:
+            self.research_empty, self.research_skip = 0, 3
 
     def _next_hypothesis(self):
         self._collect_research()
@@ -651,7 +671,7 @@ class Orchestrator:
 
     def _op_tune(self, node):
         budget = min(900.0, 0.2 * self.timer.left("search"))
-        if budget < 2 * self._est_time(node.family):
+        if budget < 6 * 0.45 * self._est_time(node.family):  # меньше ~6 проб Optuna — не имеет смысла
             return
         res = exp_runner.run_job({"kind": "tune", "config": node.config}, self.ctx, budget, f"{node.id}_tune")
         if not res.get("ok"):

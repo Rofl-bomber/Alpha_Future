@@ -92,8 +92,7 @@ def apply_patch(config: dict, patch: dict) -> dict:
     cfg = copy.deepcopy(config)
     keys = list(patch)
     if "model.name" in patch and patch["model.name"] != _get(cfg, "model.name"):
-        if not any(k.startswith("model.params") for k in keys):
-            _set(cfg, "model.params", {})
+        _set(cfg, "model.params", {})  # параметры старой модели новой не подходят
     for k in keys:
         v = patch[k]
         if k in LISTS:
@@ -106,7 +105,8 @@ def apply_patch(config: dict, patch: dict) -> dict:
                     cur.remove(item)
                 _set(cfg, k, cur)
             elif isinstance(v, list):
-                _set(cfg, k, list(dict.fromkeys(v)))
+                # непустой список добавляется к текущему (LLM часто пишет список вместо "+x"); [] — очистка
+                _set(cfg, k, list(dict.fromkeys(cur + list(v))) if v else [])
             continue
         if k == "model.params" and isinstance(v, dict):
             _set(cfg, k, dict(_get(cfg, k, {}) or {}, **v))
@@ -129,12 +129,16 @@ def validate_patch(patch: dict, config: dict, spec, known_custom=(), hints=None)
         return {}, ["патч должен быть объектом"]
     ops = set(feat_builtin.applicable_ops(spec, hints))
     flat = {}
-    for k, v in patch.items():
-        if k == "model.params" and isinstance(v, dict):
-            for pk, pv in v.items():
-                flat[f"model.params.{pk}"] = pv
-        else:
-            flat[k] = v
+
+    def walk(prefix, obj):  # вложенные словари LLM → ключи через точку
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict) and key not in LISTS:
+                walk(key, v)
+            else:
+                flat[key] = v
+
+    walk("", patch)
     new_model = flat.get("model.name", _get(config, "model.name"))
     for k, v in flat.items():
         try:

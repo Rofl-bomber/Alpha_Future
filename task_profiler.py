@@ -155,7 +155,7 @@ def run_adversarial(spec, prof: dict, ctx) -> dict:
     return out
 
 
-def summary_text(spec, prof: dict, max_cols: int = 60) -> str:
+def summary_text(spec, prof: dict, max_cols: int = 80) -> str:
     """Сжатая сводка профиля для LLM."""
     lines = [f"Строк: train={prof['n_train']}, test={prof['n_test']}; признаков={prof['n_features']}",
              f"Задача: {spec.short()}"]
