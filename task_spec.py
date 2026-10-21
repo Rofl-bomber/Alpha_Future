@@ -430,8 +430,15 @@ def apply_analyst(spec: TaskSpec, out: dict, train: pd.DataFrame) -> TaskSpec:
                 spec.metric = alias
                 spec.metric_source = "Аналитик"
     elif out.get("custom_metric_code") and m:
-        spec.custom_metric_code = str(out["custom_metric_code"])
-        spec.metric_source = "Аналитик (своя метрика)"
+        code = str(out["custom_metric_code"])
+        need = "value" if spec.task_type in ("regression", "multi_regression") else "label"
+        gib = bool(out.get("greater_is_better")) if out.get("greater_is_better") is not None else spec.greater_is_better
+        if _custom_metric_works(code, spec.task_type):
+            spec.custom_metric_code = code
+            spec.metric_need, spec.greater_is_better = need, gib
+            spec.metric_source = f"Аналитик (своя метрика «{m[:40]}»)"
+        else:
+            spec.conflicts.append(f"код метрики «{m[:40]}» от Аналитика не прошёл проверку; оставляем {spec.metric}")
     if spec.task_type in ("binary", "multiclass") and not spec.classes:
         _classes_and_kind(spec, train, None)
     pos = out.get("positive_class")
@@ -452,6 +459,21 @@ def apply_analyst(spec: TaskSpec, out: dict, train: pd.DataFrame) -> TaskSpec:
     if spec.custom_metric_code is None:
         _finish_metric(spec)
     return spec
+
+
+def _custom_metric_works(code: str, task_type: str) -> bool:
+    """Проверить код метрики от LLM на игрушечных примерах: число, конечное, без исключений."""
+    try:
+        m = task_metrics.custom_metric(code, "value", True)
+        if task_type in ("regression", "multi_regression"):
+            y = np.array([1.0, 2.0, 3.0, 4.0])
+            vals = [m.fn(y, y), m.fn(y, y[::-1])]
+        else:
+            y = np.array([0, 1, 1, 0])
+            vals = [m.fn(y, y), m.fn(y, 1 - y)]
+        return all(np.isfinite(v) for v in vals) and vals[0] != vals[1]
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------- данные для моделей

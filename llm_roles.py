@@ -31,6 +31,13 @@ class AnalystOut(BaseModel):
     custom_metric_code: str | None = None
     notes: list = Field(default_factory=list)
 
+    @field_validator("out_of_library", mode="before")
+    @classmethod
+    def _ool(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "yes", "1", "да")
+        return bool(v)
+
     @field_validator("notes", mode="before")
     @classmethod
     def _notes(cls, v):
@@ -81,6 +88,11 @@ class CriticOut(BaseModel):
     verdict: str = "accept"
     reason: str = ""
 
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _r(cls, v):
+        return "" if v is None else str(v)
+
     @field_validator("verdict", mode="before")
     @classmethod
     def _v(cls, v):
@@ -91,6 +103,18 @@ class CriticOut(BaseModel):
 class FinalCriticOut(BaseModel):
     exclude: list = Field(default_factory=list)
     reason: str = ""
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _r(cls, v):
+        return "" if v is None else str(v)
+
+    @field_validator("exclude", mode="before")
+    @classmethod
+    def _ex(cls, v):
+        if v is None:
+            return []
+        return v if isinstance(v, list) else [v]
 
 
 def analyst(client, task_md: str, rules: str, columns: str, sample: str) -> dict:
