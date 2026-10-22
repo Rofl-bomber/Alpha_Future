@@ -3,6 +3,14 @@
 Значения по умолчанию рассчитаны на платформу (3 часа, 8 CPU, 32 GB).
 Любое поле можно переопределить переменной окружения AGENT_<ИМЯ_ПОЛЯ_В_ВЕРХНЕМ_РЕГИСТРЕ>,
 например AGENT_TIME_BUDGET=1800 для 30-минутного прогона на стенде.
+
+Границы фаз — доли AGENT_TIME_BUDGET, переопределяются AGENT_PHASE_SPEC, AGENT_PHASE_L1,
+AGENT_PHASE_DIAG, AGENT_PHASE_SEARCH, AGENT_PHASE_RESEED, AGENT_PHASE_FINAL (числа в (0, 1],
+строго по возрастанию; иначе берутся значения по умолчанию).
+
+AGENT_UNLIMITED=1 — режим без внутренних ограничений: время ограничивают только AGENT_TIME_BUDGET
+и границы фаз (каждое действие может идти до конца своей фазы), max_tokens в запросы к LLM не
+передаётся, лимиты токенов на прогон и таймаут одного вызова LLM сняты.
 """
 
 import os
@@ -21,6 +29,7 @@ PHASES = {
     "final": 178 / 180,
     "end": 1.0,
 }
+PHASE_ORDER = ("spec", "l1", "diag", "search", "reseed", "final", "end")
 
 
 def detect_cpus() -> int:
@@ -76,6 +85,7 @@ def detect_memory_gb() -> float:
 class Config:
     # Время
     time_budget: float = 3 * 3600.0
+    unlimited: bool = False  # AGENT_UNLIMITED=1: только AGENT_TIME_BUDGET и границы фаз, без лимитов токенов
     # Ресурсы
     n_jobs: int = 0  # 0 — определить автоматически
     mem_limit_gb: float = 0.0  # 0 — 85% доступной памяти
@@ -109,6 +119,7 @@ class Config:
     freeze_after: int = 4
     diagnose_every_accepted: int = 3
     tune_at_frac: float = 2 / 3
+    tune_trials: int = 40  # максимум проб Optuna за один запуск Tune
     escape_min_left_s: float = 1800.0
     max_queue: int = 12
 
@@ -137,15 +148,41 @@ class Config:
     blend_max_steps: int = 30
 
     phases: dict = field(default_factory=lambda: dict(PHASES))
+    notes: list = field(default_factory=list)  # замечания при чтении настроек, пишутся в лог
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
+def _load_phases(cfg: Config):
+    """Границы фаз из AGENT_PHASE_*: доли бюджета, строго по возрастанию."""
+    phases = dict(PHASES)
+    changed = False
+    for key in PHASE_ORDER[:-1]:
+        raw = os.environ.get("AGENT_PHASE_" + key.upper())
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            phases[key] = float(raw)
+            changed = True
+        except ValueError:
+            cfg.notes.append(f"AGENT_PHASE_{key.upper()}={raw!r} — не число, оставлено {PHASES[key]:.4f}")
+    if not changed:
+        return
+    values = [phases[k] for k in PHASE_ORDER]
+    ok = all(0 < v <= 1 for v in values) and all(a < b for a, b in zip(values, values[1:]))
+    if ok:
+        cfg.phases = phases
+        cfg.notes.append("границы фаз из окружения: " + ", ".join(f"{k}={phases[k]:.4f}" for k in PHASE_ORDER))
+    else:
+        cfg.notes.append("AGENT_PHASE_* не возрастают или вне (0, 1] — используются границы по умолчанию: "
+                         + ", ".join(f"{k}={phases[k]:.4f}" for k in PHASE_ORDER))
+
+
 def load_config() -> Config:
     cfg = Config()
     for f in fields(cfg):
-        if f.name == "phases":
+        if f.name in ("phases", "notes"):
             continue
         raw = os.environ.get("AGENT_" + f.name.upper())
         if raw is None or raw == "":
@@ -162,7 +199,10 @@ def load_config() -> Config:
                 value = raw
             setattr(cfg, f.name, value)
         except ValueError:
-            pass
+            cfg.notes.append(f"AGENT_{f.name.upper()}={raw!r} — неверное значение, оставлено {current!r}")
+    _load_phases(cfg)
+    if cfg.unlimited:
+        cfg.notes.append("режим AGENT_UNLIMITED: действия идут до конца своей фазы, лимитов токенов нет")
     if cfg.n_jobs <= 0:
         cfg.n_jobs = detect_cpus()
     if cfg.mem_limit_gb <= 0:

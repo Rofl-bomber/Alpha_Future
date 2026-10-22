@@ -43,14 +43,18 @@ def space(trial) -> dict:
 
 
 class _TimeLimit:
-    def __init__(self, deadline):
+    """Останавливает обучение на дедлайне; owner.truncated = True — модель недообучена."""
+
+    def __init__(self, deadline, owner):
         self.deadline = deadline
+        self.owner = owner
         self.order = 40
 
     def __call__(self, env):
         import lightgbm as lgb
 
         if self.deadline and time.time() > self.deadline:
+            self.owner.truncated = True
             raise lgb.callback.EarlyStopException(env.iteration, env.evaluation_result_list)
 
 
@@ -69,6 +73,7 @@ class Model:
         self.deadline = deadline
         self.booster = None
         self.best_iteration = None
+        self.truncated = False
 
     def _lgb_params(self):
         p = {k: v for k, v in self.params.items() if k not in ("n_estimators", "early_stopping_rounds")}
@@ -91,7 +96,7 @@ class Model:
         if self.fast:
             n_est = min(n_est, 1500)
         train = lgb.Dataset(X, label=y, weight=w, free_raw_data=False)
-        valid_sets, callbacks = [], [_TimeLimit(self.deadline)]
+        valid_sets, callbacks = [], [_TimeLimit(self.deadline, self)]
         if X_val is not None:
             valid = lgb.Dataset(X_val, label=y_val, reference=train, free_raw_data=False)
             valid_sets = [valid]

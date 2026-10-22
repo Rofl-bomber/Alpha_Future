@@ -30,6 +30,7 @@ class Model:
         self.n_jobs = n_jobs
         self.fast = fast
         self.best_iteration = None
+        self.truncated = False  # без пошагового обучения: при нехватке времени процесс снимается целиком
 
     def _X(self, X):
         return feat_builtin.to_numeric(X).fillna(-999.0).to_numpy(dtype=np.float32)

@@ -37,7 +37,8 @@ class Journal:
         return max(ok, key=lambda r: self._gain(r["mean"])) if ok else None
 
     def summary(self, k_top: int = 10, k_last: int = 6, k_failed: int = 10) -> str:
-        full = [r for r in self.records if r.get("mode") == "full" and r.get("mean") is not None]
+        full = [r for r in self.records if r.get("mode") == "full" and r.get("mean") is not None
+                and not r.get("truncated")]
         top = sorted(full, key=lambda r: -self._gain(r["mean"]))[:k_top]
         lines = ["Лучшие эксперименты (полная оценка):"]
         for r in top:
@@ -51,7 +52,7 @@ class Journal:
                          + f": {_short(r.get('desc'))}" + (f" — ошибка: {_short(r.get('error'), 120)}"
                                                            if r.get('error') else ""))
         failed = [r for r in self.records if r.get("status") in ("rejected", "screen_rejected", "failed",
-                                                                  "flagged", "invalid")][-k_failed:]
+                                                                  "flagged", "invalid", "truncated")][-k_failed:]
         if failed:
             lines.append("Не сработало (не повторять в том же виде):")
             for r in failed:
@@ -68,6 +69,7 @@ class Journal:
         return st
 
     def times(self, family: str, mode: str = "full"):
+        """Медианное время прогона семейства (обрезанные прогоны тоже учитываются: время они заняли)."""
         ts = [r["time_s"] for r in self.records if r.get("family") == family and r.get("mode") == mode
               and r.get("time_s")]
         return float(np.median(ts)) if ts else None

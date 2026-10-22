@@ -117,32 +117,36 @@ class FinalCriticOut(BaseModel):
         return v if isinstance(v, list) else [v]
 
 
-def analyst(client, task_md: str, rules: str, columns: str, sample: str) -> dict:
+def analyst(client, task_md: str, rules: str, columns: str, sample: str, timeout=None) -> dict:
     system = llm_prompts.ANALYST_SYSTEM.format(metrics=", ".join(task_metrics.REGISTRY))
     user = llm_prompts.ANALYST_USER.format(task_md=task_md[:14000], rules=rules, columns=columns[:12000],
                                            sample=sample[:1500])
     out = client.chat_json([{"role": "system", "content": system}, {"role": "user", "content": user}],
-                           role="analyst", schema=AnalystOut, max_tokens=client.cfg.researcher_max_tokens)
+                           role="analyst", schema=AnalystOut, max_tokens=client.cfg.researcher_max_tokens,
+                           timeout=timeout)
     return out.model_dump()
 
 
-def researcher(client, schema: str, n: int, context: dict) -> list:
+def researcher(client, schema: str, n: int, context: dict, timeout=None) -> list:
     system = llm_prompts.RESEARCHER_SYSTEM.format(schema=schema, n=n)
     user = llm_prompts.RESEARCHER_USER.format(**context)
     out = client.chat_json([{"role": "system", "content": system}, {"role": "user", "content": user}],
-                           role="researcher", schema=ResearcherOut, max_tokens=client.cfg.researcher_max_tokens)
+                           role="researcher", schema=ResearcherOut, max_tokens=client.cfg.researcher_max_tokens,
+                           timeout=timeout)
     return [h.model_dump() for h in out.hypotheses]
 
 
-def critic_jump(client, evidence: dict) -> dict:
+def critic_jump(client, evidence: dict, timeout=None) -> dict:
     user = llm_prompts.CRITIC_JUMP.format(**evidence)
     out = client.chat_json([{"role": "system", "content": llm_prompts.CRITIC_SYSTEM}, {"role": "user", "content": user}],
-                           role="critic", schema=CriticOut, max_tokens=client.cfg.researcher_max_tokens)
+                           role="critic", schema=CriticOut, max_tokens=client.cfg.researcher_max_tokens,
+                           timeout=timeout)
     return out.model_dump()
 
 
-def critic_final(client, task: str, finalists: str) -> dict:
+def critic_final(client, task: str, finalists: str, timeout=None) -> dict:
     user = llm_prompts.CRITIC_FINAL.format(task=task, finalists=finalists)
     out = client.chat_json([{"role": "system", "content": llm_prompts.CRITIC_SYSTEM}, {"role": "user", "content": user}],
-                           role="critic", schema=FinalCriticOut, max_tokens=client.cfg.researcher_max_tokens)
+                           role="critic", schema=FinalCriticOut, max_tokens=client.cfg.researcher_max_tokens,
+                           timeout=timeout)
     return out.model_dump()

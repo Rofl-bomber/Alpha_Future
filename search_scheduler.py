@@ -60,7 +60,8 @@ class Scheduler:
             self.no_accept = 0
             self.diag_pending = True
             self.pop.unfreeze_all()
-            if not self.escape_done and self.timer.left("search") > self.cfg.escape_min_left_s:
+            enough = self.cfg.unlimited or self.timer.left("search") > self.cfg.escape_min_left_s
+            if not self.escape_done and enough:
                 self.escape_done = True
                 return Action("escape")
             if restart_options:

@@ -49,6 +49,7 @@ class Model:
         self.deadline = deadline
         self.objective = objective or "l2"
         self.best_iteration = None
+        self.truncated = False
 
     # --------------------------------------------------------------- torch
     def _net(self, d_in, d_out):
@@ -111,6 +112,7 @@ class Model:
                     if bad >= int(p["patience"]):
                         break
             if self.deadline and time.time() > self.deadline:
+                self.truncated = epoch + 1 < max(1, epochs)  # остановлены раньше плана по эпохам
                 break
         if best_state is not None:
             self.net.load_state_dict(best_state)

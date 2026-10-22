@@ -5,6 +5,11 @@
   финальная сборка и выбор на selection-holdout → запись.
 LLM только предлагает (Аналитик, Исследователь, Инженер, Критик); метрику считает харнесс,
 решение «оставить / откатить» принимает этот модуль.
+
+Бюджеты действий: в обычном режиме — оценки по времени прошлых прогонов; в режиме AGENT_UNLIMITED
+каждое действие может идти до конца своей фазы (_budget, _can_start), других ограничений нет.
+Результат, обученный не до конца из-за дедлайна (truncated), пишется в журнал со скорами по
+пройденным фолдам и дельтой к родителю, но в решениях не участвует.
 """
 
 import concurrent.futures as cf
@@ -38,6 +43,7 @@ log = logging.getLogger("agent")
 
 TIME_FACTOR = {"lgbm": 1.0, "xgb": 1.5, "catboost": 2.0, "extratrees": 1.0, "linear": 0.6, "mlp": 2.0,
                "custom": 2.0, "escape": 3.0}
+MIN_START_S = 5.0  # AGENT_UNLIMITED: действие не начинается, если до конца фазы меньше этого
 
 
 class Orchestrator:
@@ -118,8 +124,9 @@ class Orchestrator:
                 rules = spec.to_json()[:4000]
                 cols = task_spec.dictionary_summary(spec, data)
                 sample_txt = sample.head(5).to_string() if sample is not None else "нет"
-                out = self._with_timeout(lambda: llm_roles.analyst(self.llm, text, rules, cols, sample_txt),
-                                         max(30.0, min(240.0, self.timer.left("l1") * 0.4)))
+                t_an = self._budget("l1", max(30.0, min(240.0, self.timer.left("l1") * 0.4)))
+                out = self._with_timeout(lambda: llm_roles.analyst(self.llm, text, rules, cols, sample_txt,
+                                                                   timeout=t_an), t_an)
                 before = (spec.task_type, spec.metric, tuple(spec.classes))
                 spec = task_spec.apply_analyst(spec, out, train)
                 if (spec.task_type, spec.metric, tuple(spec.classes)) != before:
@@ -183,6 +190,21 @@ class Orchestrator:
         fut = self.sync_pool.submit(fn)
         return fut.result(timeout=timeout)
 
+    def _budget(self, phase: str, limited: float) -> float:
+        """Бюджет действия, с: в AGENT_UNLIMITED — до конца фазы, иначе — переданная оценка."""
+        if self.cfg.unlimited:
+            return max(1.0, self.timer.left(phase))
+        return limited
+
+    def _can_start(self, phase: str, need: float) -> bool:
+        """Можно ли начать действие: в AGENT_UNLIMITED — если до конца фазы есть MIN_START_S."""
+        left = self.timer.left(phase)
+        return left >= MIN_START_S if self.cfg.unlimited else left >= need
+
+    def _deadline(self, phase: str, limited: float) -> float:
+        """Абсолютный дедлайн действия (epoch): в AGENT_UNLIMITED — конец фазы."""
+        return self.timer.deadline(phase) if self.cfg.unlimited else limited
+
     def _emergency_constant(self):
         """Подготовка упала до появления сабмита: пишем константу по правилам, без LLM."""
         try:
@@ -202,10 +224,17 @@ class Orchestrator:
         tries.append(("L1: LightGBM, быстрый", fast))
         tries.append(("L1: ExtraTrees", search_operators.apply_patch(base, {"model.name": "extratrees"})))
         for desc, cfg in tries:
-            budget = max(60.0, self.timer.left("reseed") * 0.5 if self.l1 is None else 0)
+            # L1 обязателен: в AGENT_UNLIMITED он может идти до конца фазы поиска
+            budget = self._budget("search", max(60.0, self.timer.left("reseed") * 0.5))
             node = self._new_node(cfg, None, "anchor", desc, branch="b0")
             res = exp_runner.run_experiment(node.id, cfg, self.ctx, "full", budget_s=budget)
             node.result = res
+            if res.get("ok") and res.get("truncated"):
+                node.status, node.reason = "truncated", f"обучение остановлено по дедлайну: {res.get('stop_reason')}"
+                self._journal(node, "truncated", mode="full")
+                log.warning("L1 (%s) обрезан по времени: CV %.6g на фолдах %s — пробую следующий вариант", desc,
+                            res["mean"], [k + 1 for k in res.get("folds_done", [])])
+                continue
             if res.get("ok"):
                 self.l1 = node
                 self.pop.set_anchor(node)
@@ -250,6 +279,9 @@ class Orchestrator:
         if res and res.get("ok"):
             rec.update(fold_scores=res["fold_scores"], mean=res["mean"], std=res["std"], time_s=res["time_s"],
                        best_iter=res.get("best_iter"), n_features=res.get("n_features"))
+        if res:
+            rec.update(truncated=bool(res.get("truncated")), folds_done=res.get("folds_done"),
+                       stop_reason=res.get("stop_reason"), budget_s=res.get("budget_s"))
         elif res and res.get("wall_s") and (res.get("timed_out") or "исчерпан" in str(res.get("error", ""))):
             rec["time_s"] = res["wall_s"]  # прогон не уложился в бюджет — оценка времени семейства растёт
         if extra:
@@ -280,8 +312,8 @@ class Orchestrator:
 
     # ================================================================== диагностика
     def _initial_diagnosis(self):
-        self._diagnose(self.l1, phase_deadline=max(self.timer.deadline("diag"),
-                                                   time.time() + 0.08 * max(0.0, self.timer.left("search"))))
+        limited = max(self.timer.deadline("diag"), time.time() + 0.08 * max(0.0, self.timer.left("search")))
+        self._diagnose(self.l1, phase_deadline=self._deadline("search", limited))
         self.scheduler.diag_pending = False
         # сегменты с крупнейшими ошибками фиксируются один раз, до поиска: признаки узлов не меняются по ходу
         if self.segments:
@@ -295,8 +327,9 @@ class Orchestrator:
         if node is None or node.mean is None:
             return
         t0 = time.time()
-        deadline = phase_deadline or (time.time() + min(0.12 * self.timer.left("search"), 900.0))
-        est = self._est_time(node.family) * 0.45
+        deadline = phase_deadline or self._deadline("search",
+                                                    time.time() + min(0.12 * self.timer.left("search"), 900.0))
+        est = 0.0 if self.cfg.unlimited else self._est_time(node.family) * 0.45
         texts = []
         try:
             preds = self._load_preds(node)
@@ -310,9 +343,10 @@ class Orchestrator:
             log.warning("анализ ошибок не удался: %s", e)
 
         def screen(cfg, tag):
-            budget = min(max(30.0, deadline - time.time()), max(60.0, est * 3))
-            if deadline - time.time() < 10:
+            left = deadline - time.time()
+            if left < (MIN_START_S if self.cfg.unlimited else 10.0):
                 return None
+            budget = left if self.cfg.unlimited else min(max(30.0, left), max(60.0, est * 3))
             return exp_runner.run_experiment(tag, cfg, self.ctx, "screen", budget_s=budget)
 
         if deadline - time.time() > est:
@@ -333,10 +367,8 @@ class Orchestrator:
     # ================================================================== поиск
     def _search(self):
         while True:
-            left = self.timer.left("search")
             best = self.pop.best() or self.l1
-            est = self._est_time(best.family)
-            if left < max(30.0, 0.6 * est):
+            if not self._can_start("search", max(30.0, 0.6 * self._est_time(best.family))):
                 break
             tried = {self.pop.nodes[i].family for i in self.pop.nodes}
             restart = [o for o in search_operators.restart_options(self.spec, tried)
@@ -401,8 +433,10 @@ class Orchestrator:
         ctx = self._research_context(parent)
         schema = search_operators.schema_text(self.spec, self.hints)
 
+        timeout = max(MIN_START_S, self.timer.left("search")) if self.cfg.unlimited else None
+
         def call():
-            return llm_roles.researcher(self.llm, schema, 4, ctx)
+            return llm_roles.researcher(self.llm, schema, 4, ctx, timeout=timeout)
 
         self.research_future = self.pool.submit(call)
 
@@ -434,12 +468,21 @@ class Orchestrator:
         if self.research_empty >= 2:
             self.research_empty, self.research_skip = 0, 3
 
+    def _library_left(self) -> bool:
+        return any(self._sig(h) not in self.tried_sigs for h in self.library_queue)
+
     def _next_hypothesis(self):
+        """Следующая гипотеза: очередь (Исследователь, абляции), затем библиотека.
+
+        Ответ Исследователя не ждём, пока есть непроверенные гипотезы библиотеки: он подхватится,
+        как только придёт. Ждём, только если проверять больше нечего.
+        """
         self._collect_research()
         if len(self.queue) < 2:
             self._start_research()
-        if not self.queue and self.research_future is not None:
-            self._collect_research(wait=max(1.0, min(self.cfg.llm_timeout_s * 1.5, self.timer.left("search") - 30)))
+        if not self.queue and self.research_future is not None and not self._library_left():
+            limited = min(self.cfg.llm_timeout_s * 1.5, self.timer.left("search") - 30)
+            self._collect_research(wait=max(1.0, self._budget("search", limited)))
         while self.queue:
             h = self.queue.pop(0)
             sig = self._sig(h)
@@ -470,7 +513,8 @@ class Orchestrator:
         if kind in ("feature_code", "model_code"):
             slot = "features" if kind == "feature_code" else "model"
             slot_id = self._slot_id("fe" if slot == "features" else "mc")
-            deadline = min(self.timer.deadline("search") - 30, time.time() + max(300.0, 0.15 * self.timer.left("search")))
+            deadline = self._deadline("search", min(self.timer.deadline("search") - 30,
+                                                    time.time() + max(300.0, 0.15 * self.timer.left("search"))))
             impl = self._implement(slot, slot_id, hyp, deadline)
             if not impl:
                 return
@@ -533,20 +577,34 @@ class Orchestrator:
     def _screen_of(self, node):
         if node.id not in self.screen_cache:
             res = exp_runner.run_experiment(node.id, node.config, self.ctx, "screen",
-                                            budget_s=max(60.0, self._est_time(node.family)))
+                                            budget_s=self._budget("search", max(60.0, self._est_time(node.family))))
             self.screen_cache[node.id] = res
         return self.screen_cache[node.id]
 
     def _alt_of(self, node):
         if node.id not in self.alt_cache:
             res = exp_runner.run_experiment(node.id, node.config, self.ctx, "alt",
-                                            budget_s=max(60.0, self._est_time(node.family)))
+                                            budget_s=self._budget("search", max(60.0, self._est_time(node.family))))
             self.alt_cache[node.id] = res
         return self.alt_cache[node.id]
 
     def _cmp(self, a, b):
         return eval_acceptance.paired_compare(a, b, self.gib, self.min_delta, self.cfg.accept_min_fold_frac,
                                               self.cfg.noise_se_mult)
+
+    def _record_truncated(self, node, parent, mode, res, ref_scores):
+        """Обрезанный по дедлайну прогон: сводка в журнал и лог, в решениях не участвует."""
+        done = res.get("folds_done") or []
+        ref = [ref_scores[k] for k in done if k < len(ref_scores)] if ref_scores else []
+        cmp = self._cmp(res["fold_scores"], ref) if ref and len(ref) == len(res["fold_scores"]) else None
+        node.status = "truncated"
+        node.reason = f"обучение остановлено по дедлайну: {res.get('stop_reason')}"
+        extra = {"wins": cmp["wins"], "se": cmp["se"], "joined": False} if cmp else None
+        self._journal(node, "truncated", mode=mode, delta=cmp["mean_gain"] if cmp else None, extra=extra)
+        log.info("[%s] %s %s [%s, %s]: ОБРЕЗАН по времени — CV %.6g на фолдах %s%s; в решениях не участвует",
+                 self.timer.stamp(), node.id, node.op, node.family, mode, res["mean"], [k + 1 for k in done],
+                 f" (Δ=%+.4g ± %.2g, {cmp['wins']}/{cmp['k']} фолдов)" % (cmp["mean_gain"], cmp["se"]) if cmp else "")
+        self.scheduler.feedback(False, counts_for_plateau=False)
 
     def _evaluate(self, config, parent, op, desc, branch, hyp=None):
         h = search_operators.config_hash(config)
@@ -555,18 +613,23 @@ class Orchestrator:
             return None
         fam = search_operators.family(config)
         est = self._est_time(fam)
-        left = self.timer.left("search")
-        if left < 1.1 * est:
-            log.info("на эксперимент %s не хватает времени поиска (%.0f с из ~%.0f с)", fam, left, est)
+        if not self._can_start("search", 1.1 * est):
+            log.info("на эксперимент %s не хватает времени поиска (%.0f с из ~%.0f с)", fam,
+                     self.timer.left("search"), est)
             return None
         node = self._new_node(config, parent, op, desc, branch, hyp)
         self.evaluated[h] = node.id
         # скрининг: дешёвая оценка на 3 фолдах, в полную оценку проходят не явно худшие
-        if est > self.cfg.screen_if_full_s and parent.fold_scores and left > 1.6 * est:
+        screen_room = self.cfg.unlimited or self.timer.left("search") > 1.6 * est
+        if est > self.cfg.screen_if_full_s and parent.fold_scores and screen_room:
             ps = self._screen_of(parent)
-            sb = min(max(60.0, est), self.timer.left("search") - est)
+            sb = self._budget("search", min(max(60.0, est), self.timer.left("search") - est))
             node.screen = exp_runner.run_experiment(node.id, config, self.ctx, "screen", budget_s=sb)
-            if node.screen.get("ok") and ps.get("ok"):
+            if node.screen.get("ok") and node.screen.get("truncated"):
+                ref = ps.get("fold_scores") if ps.get("ok") and not ps.get("truncated") else None
+                self._record_truncated(node, parent, "screen", node.screen, ref)
+                return node
+            if node.screen.get("ok") and ps.get("ok") and not ps.get("truncated"):
                 c = self._cmp(node.screen["fold_scores"], ps["fold_scores"])
                 if c["mean_gain"] < -c["se"]:
                     node.status, node.reason = "screen_rejected", f"скрининг Δ={c['mean_gain']:+.4g}"
@@ -574,13 +637,16 @@ class Orchestrator:
                     self.pop.note_child(parent.id, False)
                     self.scheduler.feedback(False)
                     return node
-        left = self.timer.left("search")
-        if left < 1.05 * est:
+        if not self._can_start("search", 1.05 * est):
             node.status, node.reason = "skipped", "после скрининга не осталось времени на полную оценку"
             self._journal(node, "skipped", mode="screen")
             return node
-        budget = min(left - 5, max(3 * est, 120.0))
+        left = self.timer.left("search")
+        budget = self._budget("search", min(left - 5, max(3 * est, 120.0)))
         node.result = exp_runner.run_experiment(node.id, config, self.ctx, "full", budget_s=budget)
+        if node.result.get("ok") and node.result.get("truncated"):
+            self._record_truncated(node, parent, "full", node.result, parent.fold_scores)
+            return node
         if not node.result.get("ok"):
             node.status = "failed"
             self._journal(node, "failed", mode="full")
@@ -618,12 +684,15 @@ class Orchestrator:
         return node
 
     def _recheck_jump(self, node, parent, rel) -> bool:
-        if self.timer.left("search") < self._est_time(node.family):
+        if not self._can_start("search", self._est_time(node.family)):
             node.reason = "не хватило времени перепроверить скачок"
             return False
         node.alt = exp_runner.run_experiment(node.id, node.config, self.ctx, "alt",
-                                             budget_s=max(60.0, self._est_time(node.family)))
+                                             budget_s=self._budget("search", max(60.0, self._est_time(node.family))))
         pa = self._alt_of(parent)
+        if node.alt.get("truncated") or pa.get("truncated"):
+            node.reason = "перепроверка скачка обрезана по времени — без неё скачок не принимается"
+            return False
         if not (node.alt.get("ok") and pa.get("ok")):
             node.reason = "перепроверка скачка не выполнена"
             return False
@@ -653,7 +722,8 @@ class Orchestrator:
                   parent_time=parent.result.get("time_s"), cand_time=node.result.get("time_s"), alt=alt_text,
                   flags=node.flags, code=code[-8000:])
         try:
-            v = self._with_timeout(lambda: llm_roles.critic_jump(self.llm, ev), self.cfg.llm_timeout_s)
+            t_cr = self._budget("search", self.cfg.llm_timeout_s)
+            v = self._with_timeout(lambda: llm_roles.critic_jump(self.llm, ev, timeout=t_cr), t_cr)
         except Exception as e:  # noqa: BLE001
             log.warning("Критик не ответил: %s", str(e)[:200])
             return True
@@ -670,10 +740,13 @@ class Orchestrator:
         self._evaluate(merged, a, "merge", desc, a.branch, {"kind": "merge", "patch": {"merge": [a.id, b.id]}})
 
     def _op_tune(self, node):
-        budget = min(900.0, 0.2 * self.timer.left("search"))
-        if budget < 6 * 0.45 * self._est_time(node.family):  # меньше ~6 проб Optuna — не имеет смысла
+        budget = self._budget("search", min(900.0, 0.2 * self.timer.left("search")))
+        if not self.cfg.unlimited and budget < 6 * 0.45 * self._est_time(node.family):  # меньше ~6 проб — не стоит
             return
-        res = exp_runner.run_job({"kind": "tune", "config": node.config}, self.ctx, budget, f"{node.id}_tune")
+        if not self._can_start("search", 0.0):
+            return
+        res = exp_runner.run_job({"kind": "tune", "config": node.config, "n_trials": self.cfg.tune_trials},
+                                 self.ctx, budget, f"{node.id}_tune")
         if not res.get("ok"):
             log.info("Tune %s не удался: %s", node.id, str(res.get("error"))[:200])
             return
@@ -691,7 +764,8 @@ class Orchestrator:
                                 "модель и предсказания. Учитывай метрику " + self.spec.metric + "."),
                "expected": "работоспособное решение для нестандартной задачи"}
         slot_id = self._slot_id("es")
-        deadline = min(self.timer.deadline("search") - 60, time.time() + max(600.0, 0.2 * self.timer.left("search")))
+        deadline = self._deadline("search", min(self.timer.deadline("search") - 60,
+                                                time.time() + max(600.0, 0.2 * self.timer.left("search"))))
         impl = self._implement("escape", slot_id, hyp, deadline)
         if not impl:
             return
@@ -721,15 +795,22 @@ class Orchestrator:
             if n.op == "escape":
                 continue
             est = self._est_time(n.family) * self.cfg.reseed_seeds
-            if self.timer.left("reseed") < est * 0.9:
+            if not self._can_start("reseed", est * 0.9):
                 continue
             seeds = list(range(1, self.cfg.reseed_seeds + 1))
             res = exp_runner.run_experiment(n.id, n.config, self.ctx, "full", seeds=seeds,
-                                            budget_s=min(self.timer.left("reseed"), est * 2))
-            if res.get("ok"):
+                                            budget_s=self._budget("reseed", min(self.timer.left("reseed"), est * 2)))
+            if res.get("ok") and res.get("truncated"):
+                log.info("[%s] сиды %s обрезаны по времени (%s): полных сидов %d из %d — проверка стабильности "
+                         "не засчитана", self.timer.stamp(), n.id, res.get("stop_reason"),
+                         len(res.get("seed_means", [])), len(seeds))
+            elif res.get("ok"):
                 n.reseed = res
                 means = [n.mean] + list(res.get("seed_means", []))
                 log.info("[%s] сиды %s: %s", self.timer.stamp(), n.id, [round(m, 6) for m in means])
+            else:
+                log.info("[%s] сиды %s не удались: %s", self.timer.stamp(), n.id,
+                         str(res.get("error")).splitlines()[0][:200])
         self.finalists = finalists
 
     def _combined(self, node):
@@ -815,8 +896,9 @@ class Orchestrator:
                          f"time={n.result.get('time_s')}s op={n.op}: {n.desc[:150]}; "
                          f"changes vs L1: {search_operators.diff(self.l1.config, n.config)}")
         try:
-            out = self._with_timeout(lambda: llm_roles.critic_final(self.llm, self.task_text, "\n".join(lines)),
-                                     min(self.cfg.llm_timeout_s, max(30.0, self.timer.left("final") * 0.2)))
+            t_cr = self._budget("final", min(self.cfg.llm_timeout_s, max(30.0, self.timer.left("final") * 0.2)))
+            out = self._with_timeout(lambda: llm_roles.critic_final(self.llm, self.task_text, "\n".join(lines),
+                                                                    timeout=t_cr), t_cr)
         except Exception as e:  # noqa: BLE001
             log.warning("Критик (финал) не ответил: %s", str(e)[:200])
             return set()
@@ -829,7 +911,7 @@ class Orchestrator:
         """Переобучение членов победителя на всех размеченных строках; test = 0.5·фолды + 0.5·refit."""
         members = winner["nodes"]
         est = sum(self._est_time(n.family) / max(1, n.result.get("n_folds", 5)) * 1.3 for n in members)
-        if self.timer.left("final") < est * 1.5 + 20:
+        if not self._can_start("final", est * 1.5 + 20):
             log.info("refit пропущен: не хватает времени (нужно ~%.0f с)", est * 1.5)
             return
         y_hold = self.vault.release()
@@ -840,10 +922,13 @@ class Orchestrator:
             n_est = int(bi * 1.1) + 1 if bi and n.family in exp_runner.BOOSTING else None
             job = {"kind": "refit", "config": n.config, "node_id": n.id, "seeds": [0],
                    "y_holdout_path": str(self.workdir / "y_holdout.npy"), "n_estimators": n_est}
-            budget = max(30.0, self.timer.left("final") - 10)
+            budget = self._budget("final", max(30.0, self.timer.left("final") - 10))
             res = exp_runner.run_job(job, self.ctx, budget, f"{n.id}_refit")
             if not res.get("ok"):
                 log.info("refit %s не удался: %s", n.id, str(res.get("error"))[:200])
+                return
+            if res.get("truncated"):
+                log.info("refit %s обрезан по времени — не используется, остаётся сабмит по фолдам", n.id)
                 return
             te_refit.append(np.load(res["preds_path"])["te"])
         te_r = final_ensemble.blend(te_refit, winner["w"])

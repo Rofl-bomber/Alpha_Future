@@ -145,7 +145,11 @@ def run_adversarial(spec, prof: dict, ctx) -> dict:
 
     exclude = [c for c in (prof.get("group_col"), prof.get("time_col")) if c]
     job = {"kind": "adversarial", "exclude": exclude}
-    res = exp_runner.run_job(job, ctx, timeout=min(300.0, max(60.0, ctx.timer.left("l1") * 0.3)), tag="adversarial")
+    if ctx.cfg.unlimited:  # без внутренних лимитов: до конца фазы L1
+        timeout = max(5.0, ctx.timer.left("l1"))
+    else:
+        timeout = min(300.0, max(60.0, ctx.timer.left("l1") * 0.3))
+    res = exp_runner.run_job(job, ctx, timeout=timeout, tag="adversarial")
     if not res.get("ok"):
         log.warning("adversarial validation не удалась: %s", str(res.get("error"))[:300])
         return {"auc": None}

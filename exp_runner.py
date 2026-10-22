@@ -7,6 +7,12 @@
 Метрику считает только этот код; LLM получает лишь итоговые числа.
 
 Виды заданий: experiment (режимы full / screen / alt), tune, refit, adversarial.
+
+Если обучение остановлено по дедлайну (модель недообучена или не все фолды пройдены), результат
+помечается truncated=True: скоры по пройденным фолдам, среднее и время в нём есть, но
+предсказания не сохраняются и оркестратор не использует такой результат в решениях.
+Каждое задание пишет в logs/<задание>.log ход работы и итоговую сводку; родитель дописывает
+туда же итог процесса (код возврата, время, таймаут, память).
 """
 
 import copy
@@ -125,13 +131,56 @@ def launch(script: str, args: list, ctx: RunContext, timeout: float, tag: str) -
         except Exception:
             kill_tree(proc.pid)
         ctx.registry.remove(proc)
+    info = {"returncode": proc.returncode, "timed_out": timed_out, "mem_killed": mem_killed,
+            "time_s": round(time.time() - t0, 2), "peak_gb": round(peak / 1024**3, 2)}
+    reason = ("снят по таймауту" if timed_out else "снят по лимиту памяти" if mem_killed
+              else f"завершился, код {proc.returncode}")
+    append_log(log_path, f"== процесс {reason}: {info['time_s']:.1f} с из лимита {timeout:.0f} с, "
+                         f"пик памяти {info['peak_gb']:.2f} GB")
     try:
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            tail = f.read()[-4000:]
+            info["tail"] = f.read()[-4000:]
     except Exception:
-        tail = ""
-    return {"returncode": proc.returncode, "timed_out": timed_out, "mem_killed": mem_killed, "tail": tail,
-            "time_s": round(time.time() - t0, 2), "peak_gb": round(peak / 1024**3, 2)}
+        info["tail"] = ""
+    return info
+
+
+def append_log(path, text: str):
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text.rstrip("\n") + "\n")
+    except Exception:
+        pass
+
+
+def summary_line(kind: str, res: dict) -> str:
+    """Короткая сводка результата задания для лога."""
+    if not res.get("ok"):
+        err = str(res.get("error") or "").strip().splitlines()
+        head = err[0][:300] if err else "без текста"
+        extra = f"; пройдено фолдов: {res['progress']}" if res.get("progress") else ""
+        return f"== итог: ОШИБКА — {head}{extra}"
+    parts = []
+    if res.get("truncated"):
+        parts.append(f"ОБРЕЗАН ({res.get('stop_reason')})")
+    else:
+        parts.append("успех")
+    if res.get("fold_scores") is not None:
+        done = res.get("folds_done")
+        folds = ", ".join(f"{v:.6g}" for v in res["fold_scores"])
+        parts.append(f"CV {res['mean']:.6g} ± {res.get('std', 0):.3g}; фолды"
+                     + (f" {[k + 1 for k in done]}" if done is not None else "") + f": [{folds}]")
+        if res.get("seed_means") and len(res["seed_means"]) > 1:
+            parts.append("по сидам: " + ", ".join(f"{v:.6g}" for v in res["seed_means"]))
+    if kind == "tune":
+        parts.append(f"проб Optuna: {res.get('n_trials')}, лучший результат {res.get('best_gain')}")
+    if kind == "adversarial" and res.get("auc") is not None:
+        parts.append(f"AUC {res['auc']:.4f}")
+    if res.get("time_s") is not None:
+        parts.append(f"время {res['time_s']:.1f} с")
+    if res.get("budget_s") is not None:
+        parts.append(f"бюджет {res['budget_s']:.0f} с")
+    return "== итог: " + "; ".join(parts)
 
 
 def run_job(job: dict, ctx: RunContext, timeout: float, tag: str) -> dict:
@@ -146,6 +195,9 @@ def run_job(job: dict, ctx: RunContext, timeout: float, tag: str) -> dict:
         res_path.unlink()
     job["result_path"] = str(res_path)
     job_path.write_text(json.dumps(job, ensure_ascii=False, default=str), encoding="utf-8")
+    progress_path = Path(str(res_path) + ".progress")
+    if progress_path.exists():
+        progress_path.unlink()
     info = launch("exp_runner.py", [job_path], ctx, timeout + 15.0, tag)
     if res_path.exists():
         try:
@@ -157,8 +209,15 @@ def run_job(job: dict, ctx: RunContext, timeout: float, tag: str) -> dict:
             return {"ok": False, "error": f"не прочитан результат: {e}", "wall_s": info["time_s"]}
     reason = ("таймаут" if info["timed_out"] else "превышен лимит памяти" if info["mem_killed"]
               else f"процесс завершился с кодом {info['returncode']}")
-    return {"ok": False, "error": f"{reason}\n{info['tail'][-2500:]}", "wall_s": info["time_s"],
-            "timed_out": info["timed_out"], "mem_killed": info["mem_killed"]}
+    res = {"ok": False, "error": f"{reason}\n{info['tail'][-2500:]}", "wall_s": info["time_s"],
+           "timed_out": info["timed_out"], "mem_killed": info["mem_killed"]}
+    if progress_path.exists():  # процесс снят до записи результата — сколько успел сделать
+        try:
+            res["progress"] = progress_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    append_log(ctx.p("logs", f"{tag}.log"), summary_line(job.get("kind", ""), res))
+    return res
 
 
 def run_experiment(node_id: str, config: dict, ctx: RunContext, mode: str = "full", seeds=(0,),
@@ -320,7 +379,10 @@ def _single_tasks(spec):
 
 
 def _fit_predict(config, spec, Xtr, ytr, Xva, yva, others, seed, n_jobs, fast, deadline, workdir, n_estimators=None):
-    """Обучить модель(и) на Xtr и предсказать для [Xva] + others. Возвращает (список предсказаний, best_iter, важности)."""
+    """Обучить модель(и) на Xtr и предсказать для [Xva] + others.
+
+    Возвращает (список предсказаний, best_iter, важности, число признаков, обучение остановлено по дедлайну).
+    """
     import feat_builtin
     import task_metrics
 
@@ -343,6 +405,7 @@ def _fit_predict(config, spec, Xtr, ytr, Xva, yva, others, seed, n_jobs, fast, d
         mcfg["params"] = dict(mcfg["params"], n_estimators=int(n_estimators))
     preds_all = [[] for _ in frames_e]
     best_iters, imp = [], {}
+    truncated = False
     for sub_type, n_cls, j in _single_tasks(spec):
         y_t = ytr if j is None else ytr[:, j]
         y_v = None if yva is None else (yva if j is None else yva[:, j])
@@ -385,6 +448,7 @@ def _fit_predict(config, spec, Xtr, ytr, Xva, yva, others, seed, n_jobs, fast, d
             preds = [_target_inv(p, how) for p in preds]
         for i, p in enumerate(preds):
             preds_all[i].append(p)
+        truncated = truncated or bool(getattr(model, "truncated", False))
         if model.best_iteration:
             best_iters.append(int(model.best_iteration))
         for k, v in (model.importance() or {}).items():
@@ -393,7 +457,20 @@ def _fit_predict(config, spec, Xtr, ytr, Xva, yva, others, seed, n_jobs, fast, d
         out = [np.stack(ps, axis=1) for ps in preds_all]
     else:
         out = [ps[0] for ps in preds_all]
-    return out, (int(np.mean(best_iters)) if best_iters else None), imp, len(names)
+    return out, (int(np.mean(best_iters)) if best_iters else None), imp, len(names), truncated
+
+
+def _say(msg: str):
+    """Строка в лог задания (stdout дочернего процесса перенаправлен в logs/<задание>.log)."""
+    print(msg, flush=True)
+
+
+def _progress(job, text: str):
+    """Сколько сделано — на случай, если процесс снимут до записи результата."""
+    try:
+        Path(str(job["result_path"]) + ".progress").write_text(text, encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _experiment(job):
@@ -408,6 +485,7 @@ def _experiment(job):
     workdir = Path(job["workdir"])
     t0 = time.time()
     metric = task_metrics.metric_for(spec)
+    model_name = config.get("model", {}).get("name", "lgbm")
     X = build_features(config, data, spec, hints, workdir)
     n_train = data["n_train"]
     Xtr_all = X.iloc[:n_train]
@@ -420,10 +498,12 @@ def _experiment(job):
     K = int(folds.max()) + 1
     fast = mode in ("screen", "alt")
     need_ho_te = mode == "full"
-    oof_seeds, ho, te = [], None, None
+    ho, te = None, None
     best_iters, imp_total = [], {}
     n_feat = None
-    model_name = config.get("model", {}).get("name", "lgbm")
+    seed_runs = []  # (oof, пройденные фолды) по сидам
+    truncated, stop_reason = False, "ok"
+    _say(f"признаки построены за {time.time() - t0:.1f} с: {X.shape[1]} колонок; фолдов {K}, сиды {seeds}")
 
     if model_name == "escape":
         import escape_contract
@@ -434,36 +514,76 @@ def _experiment(job):
         Rh = raw.iloc[:n_train].iloc[splits.holdout_idx].reset_index(drop=True)
         Rte = raw.iloc[n_train:].reset_index(drop=True)
         oof, ho, te = escape_contract.run_escape(code, spec, Rs, ys, Rh, Rte, folds, deadline, need_ho_te)
-        oof_seeds = [oof]
+        seed_runs = [(oof, list(range(K)))]
         n_feat = raw.shape[1]
     else:
+        n_runs = K * len(seeds)
         for s in seeds:
             seed = int(job.get("seed", 42)) + int(s)
-            oof = None
+            oof, done = None, []
             for k in range(K):
                 if time.time() > deadline:
-                    raise TimeoutError("бюджет эксперимента исчерпан")
+                    truncated, stop_reason = True, f"дедлайн наступил перед фолдом {k + 1}/{K} (сид {s})"
+                    break
+                tf = time.time()
                 tr, va = folds != k, folds == k
                 others = [Xh, Xte] if need_ho_te else []
-                preds, bi, imp, n_feat = _fit_predict(config, spec, Xs[tr], ys[tr], Xs[va], ys[va], others, seed,
-                                                      job["n_jobs"], fast, deadline, workdir)
+                preds, bi, imp, n_feat, trunc = _fit_predict(config, spec, Xs[tr], ys[tr], Xs[va], ys[va], others,
+                                                             seed, job["n_jobs"], fast, deadline, workdir)
                 if oof is None:
                     oof = np.zeros((len(ys),) + np.asarray(preds[0]).shape[1:])
                 oof[va] = preds[0]
+                done.append(k)
                 if need_ho_te:
-                    ho = preds[1] / (K * len(seeds)) if ho is None else ho + preds[1] / (K * len(seeds))
-                    te = preds[2] / (K * len(seeds)) if te is None else te + preds[2] / (K * len(seeds))
+                    ho = preds[1] / n_runs if ho is None else ho + preds[1] / n_runs
+                    te = preds[2] / n_runs if te is None else te + preds[2] / n_runs
                 if bi:
                     best_iters.append(bi)
                 for f, v in imp.items():
                     imp_total[f] = imp_total.get(f, 0.0) + v
-            oof_seeds.append(oof)
-    oof = np.mean(oof_seeds, axis=0)
+                _say(f"сид {s}, фолд {k + 1}/{K}: {time.time() - tf:.1f} с, итераций {bi}"
+                     + (" — обучение остановлено по дедлайну" if trunc else ""))
+                _progress(job, f"сид {s}: фолдов {len(done)}/{K}, {time.time() - t0:.0f} с")
+                if trunc:
+                    truncated, stop_reason = True, f"обучение остановлено по дедлайну на фолде {k + 1}/{K} (сид {s})"
+                    break
+            seed_runs.append((oof, done))
+            if truncated:
+                break
+
+    complete = [o for o, d in seed_runs if len(d) == K]
+    budget_s = round(deadline - job.get("_t_start", t0), 1)
+    top_imp = sorted(imp_total.items(), key=lambda kv: -kv[1])[:30]
+    total = sum(v for _, v in top_imp) or 1.0
+    common = {"mode": mode, "time_s": round(time.time() - t0, 2), "budget_s": budget_s, "n_folds": K,
+              "best_iter": int(np.mean(best_iters)) if best_iters else None, "n_features": n_feat,
+              "importance": [(f, round(v / total, 4)) for f, v in top_imp]}
+
+    if truncated:
+        if complete:
+            oof, done = np.mean(complete, axis=0), list(range(K))
+        else:
+            oof, done = seed_runs[0] if seed_runs else (None, [])
+        if oof is None or not done:
+            return {"ok": False, "truncated": True, "stop_reason": stop_reason,
+                    "error": f"TimeoutError: {stop_reason}; ни один фолд не пройден", **common}
+        mask = np.isin(folds, done)
+        post = final_ensemble.fit_post(oof[mask], ys[mask], spec, config.get("postprocess", {}), metric)
+        fold_scores = [task_metrics.score(metric, ys[folds == k], oof[folds == k], spec.task_type, post)
+                       for k in done]
+        seed_means = [float(np.mean([task_metrics.score(metric, ys[folds == k], o[folds == k], spec.task_type, post)
+                                     for k in range(K)])) for o in complete]
+        return {"ok": True, "truncated": True, "stop_reason": stop_reason, "folds_done": done,
+                "fold_scores": [float(v) for v in fold_scores], "mean": float(np.mean(fold_scores)),
+                "std": float(np.std(fold_scores)), "seed_means": seed_means, "preds_path": None, "post": post,
+                **common}
+
+    oof = np.mean(complete, axis=0)
     post = final_ensemble.fit_post(oof, ys, spec, config.get("postprocess", {}), metric)
     fold_scores = [task_metrics.score(metric, ys[folds == k], oof[folds == k], spec.task_type, post)
                    for k in range(K)]
     seed_means = [float(np.mean([task_metrics.score(metric, ys[folds == k], o[folds == k], spec.task_type, post)
-                                 for k in range(K)])) for o in oof_seeds]
+                                 for k in range(K)])) for o in complete]
     import eval_acceptance
 
     bad = eval_acceptance.output_check(oof, len(ys), spec.task_type if spec.task_type != "multi_regression"
@@ -477,17 +597,17 @@ def _experiment(job):
     if need_ho_te:
         arrays.update(ho=ho, te=te)
     np.savez(preds_path, **arrays)
-    top_imp = sorted(imp_total.items(), key=lambda kv: -kv[1])[:30]
-    total = sum(v for _, v in top_imp) or 1.0
-    return {"ok": True, "mode": mode, "fold_scores": [float(s) for s in fold_scores],
-            "mean": float(np.mean(fold_scores)), "std": float(np.std(fold_scores)), "seed_means": seed_means,
-            "time_s": round(time.time() - t0, 2), "best_iter": int(np.mean(best_iters)) if best_iters else None,
-            "importance": [(f, round(v / total, 4)) for f, v in top_imp], "n_features": n_feat,
-            "preds_path": str(preds_path), "post": post, "n_folds": K}
+    return {"ok": True, "truncated": False, "stop_reason": "ok", "folds_done": list(range(K)),
+            "fold_scores": [float(v) for v in fold_scores], "mean": float(np.mean(fold_scores)),
+            "std": float(np.std(fold_scores)), "seed_means": seed_means, "preds_path": str(preds_path),
+            "post": post, **common}
 
 
 def _tune(job):
-    """Optuna по параметрам модели лучшего узла на фолдах скрининга, с лимитом времени."""
+    """Optuna по параметрам модели лучшего узла на фолдах скрининга: до n_trials проб и до дедлайна.
+
+    Проба, в которой обучение остановлено по дедлайну, не засчитывается (TrialPruned).
+    """
     import optuna
 
     import final_ensemble
@@ -508,6 +628,7 @@ def _tune(job):
     base_params = dict(config["model"].get("params") or {})
 
     def objective(trial):
+        tt = time.time()
         params = dict(base_params, **mod.space(trial))
         cfg2 = copy.deepcopy(config)
         cfg2["model"]["params"] = params
@@ -516,18 +637,23 @@ def _tune(job):
             if time.time() > deadline - 5:
                 raise optuna.TrialPruned()
             tr, va = folds != k, folds == k
-            preds, _, _, _ = _fit_predict(cfg2, spec, Xs[tr], ys[tr], Xs[va], ys[va], [], int(job.get("seed", 42)),
-                                          job["n_jobs"], True, deadline, workdir)
+            preds, _, _, _, trunc = _fit_predict(cfg2, spec, Xs[tr], ys[tr], Xs[va], ys[va], [],
+                                                 int(job.get("seed", 42)), job["n_jobs"], True, deadline, workdir)
+            if trunc:
+                _say(f"проба {trial.number}: обучение остановлено по дедлайну — не засчитана")
+                raise optuna.TrialPruned()
             if oof is None:
                 oof = np.zeros((len(ys),) + np.asarray(preds[0]).shape[1:])
             oof[va] = preds[0]
         post = final_ensemble.fit_post(oof, ys, spec, config.get("postprocess", {}), metric)
         s = float(np.mean([task_metrics.score(metric, ys[folds == k], oof[folds == k], spec.task_type, post)
                            for k in range(K)]))
+        _say(f"проба {trial.number}: CV {s:.6g} за {time.time() - tt:.1f} с; {trial.params}")
         return task_metrics.gain(s, metric.greater_is_better)
 
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=int(job.get("seed", 42))))
-    study.optimize(objective, timeout=max(10.0, deadline - time.time() - 10), catch=(Exception,))
+    n_trials = int(job["n_trials"]) if job.get("n_trials") else None
+    study.optimize(objective, n_trials=n_trials, timeout=max(10.0, deadline - time.time() - 10), catch=(Exception,))
     done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not done:
         return {"ok": False, "error": "ни одна проба Optuna не завершилась"}
@@ -549,6 +675,7 @@ def _refit(job):
     y_hold = np.load(job["y_holdout_path"])
     yl = np.concatenate([data["y_search"], y_hold], axis=0)
     te = None
+    truncated = False
     seeds = job.get("seeds", [0])
     if config.get("model", {}).get("name") == "escape":
         import escape_contract
@@ -563,12 +690,14 @@ def _refit(job):
     else:
         for s in seeds:
             seed = int(job.get("seed", 42)) + int(s)
-            preds, _, _, _ = _fit_predict(config, spec, Xl, yl, None, None, [Xte], seed, job["n_jobs"], False,
-                                          job["deadline"], workdir, n_estimators=job.get("n_estimators"))
+            preds, _, _, _, trunc = _fit_predict(config, spec, Xl, yl, None, None, [Xte], seed, job["n_jobs"], False,
+                                                 job["deadline"], workdir, n_estimators=job.get("n_estimators"))
+            truncated = truncated or trunc
             te = preds[0] / len(seeds) if te is None else te + preds[0] / len(seeds)
     path = workdir / "preds" / f"{job['node_id']}_refit.npz"
     np.savez(path, te=te)
-    return {"ok": True, "preds_path": str(path)}
+    return {"ok": True, "preds_path": str(path), "truncated": truncated,
+            "stop_reason": "обучение остановлено по дедлайну" if truncated else "ok"}
 
 
 def _adversarial(job):
@@ -615,6 +744,11 @@ def main():
     warnings.filterwarnings("ignore")
     sys.path.insert(0, str(HERE))
     kind = job["kind"]
+    t_start = time.time()
+    job["_t_start"] = t_start
+    model = (job.get("config") or {}).get("model", {}).get("name")
+    _say(f"== {kind} {job.get('node_id', '')}" + (f" [{job.get('mode')}]" if job.get("mode") else "")
+         + (f", модель {model}" if model else "") + f"; бюджет {job['deadline'] - t_start:.0f} с")
     try:
         if kind == "experiment":
             res = _experiment(job)
@@ -628,6 +762,10 @@ def main():
             res = {"ok": False, "error": f"неизвестный вид задания {kind}"}
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()[-3000:]}"}
+        _say(traceback.format_exc()[-3000:])
+    res.setdefault("budget_s", round(job["deadline"] - t_start, 1))
+    res.setdefault("time_s", round(time.time() - t_start, 2))
+    _say(summary_line(kind, res))
     Path(job["result_path"]).write_text(json.dumps(res, ensure_ascii=False, default=_json_default), encoding="utf-8")
 
 

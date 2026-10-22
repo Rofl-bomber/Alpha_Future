@@ -82,6 +82,7 @@ class Model:
         self.seed = seed
         self.n_jobs = n_jobs
         self.best_iteration = None
+        self.truncated = False  # без пошагового обучения: при нехватке времени процесс снимается целиком
 
     def fit(self, X, y, w=None, X_val=None, y_val=None):
         from sklearn.linear_model import LogisticRegression, Ridge

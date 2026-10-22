@@ -40,6 +40,8 @@ def main():
     registry = core_timer.ProcessRegistry()
     log.info("старт: задача %s, бюджет %.0f с, CPU=%d, память %.1f GB, рабочий каталог %s", task, cfg.time_budget,
              cfg.n_jobs, cfg.mem_limit_gb, cfg.workdir)
+    for note in cfg.notes:
+        log.info("настройки: %s", note)
 
     def on_deadline():
         print("Агент остановлен по дедлайну; на диске лучший записанный сабмит.", flush=True)

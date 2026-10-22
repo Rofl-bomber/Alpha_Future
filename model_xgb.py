@@ -32,12 +32,16 @@ def space(trial) -> dict:
     }
 
 
-def _time_callback(deadline):
+def _time_callback(deadline, owner):
+    """Останавливает обучение на дедлайне; owner.truncated = True — модель недообучена."""
     import xgboost as xgb
 
     class _TimeLimit(xgb.callback.TrainingCallback):
         def after_iteration(self, model, epoch, evals_log):
-            return bool(deadline and time.time() > deadline)
+            if deadline and time.time() > deadline:
+                owner.truncated = True
+                return True
+            return False
 
     return _TimeLimit()
 
@@ -57,6 +61,7 @@ class Model:
         self.deadline = deadline
         self.booster = None
         self.best_iteration = None
+        self.truncated = False
 
     def fit(self, X, y, w=None, X_val=None, y_val=None):
         import xgboost as xgb
@@ -82,7 +87,7 @@ class Model:
             evals = [(xgb.DMatrix(X_val, label=y_val, enable_categorical=True), "val")]
             es = int(self.params["early_stopping_rounds"])
         self.booster = xgb.train(p, dtrain, num_boost_round=n_est, evals=evals, early_stopping_rounds=es,
-                                 verbose_eval=False, callbacks=[_time_callback(self.deadline)])
+                                 verbose_eval=False, callbacks=[_time_callback(self.deadline, self)])
         if X_val is not None and getattr(self.booster, "best_iteration", None) is not None:
             self.best_iteration = int(self.booster.best_iteration) + 1
         else:

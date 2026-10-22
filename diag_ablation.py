@@ -55,8 +55,9 @@ def variants(config: dict, spec, prof: dict) -> list:
 def run(node, spec, prof, evaluate_screen, gib: bool, time_left_fn, est_time: float) -> dict:
     """evaluate_screen(config, tag) → результат эксперимента в режиме screen (или None)."""
     base = evaluate_screen(node.config, f"{node.id}_abl_base")
-    if not base or not base.get("ok"):
-        return {"rows": [], "text": "Абляции не выполнены: базовый прогон не удался.", "focus": None, "improving": []}
+    if not base or not base.get("ok") or base.get("truncated"):
+        why = "обрезан по времени" if base and base.get("truncated") else "не удался"
+        return {"rows": [], "text": f"Абляции не выполнены: базовый прогон {why}.", "focus": None, "improving": []}
     rows, improving = [], []
     for block, name, patch in variants(node.config, spec, prof):
         if time_left_fn() < est_time * 1.2:
@@ -64,28 +65,32 @@ def run(node, spec, prof, evaluate_screen, gib: bool, time_left_fn, est_time: fl
         cfg2 = search_operators.apply_patch(node.config, patch)
         res = evaluate_screen(cfg2, f"{node.id}_abl_{len(rows)}")
         if not res or not res.get("ok"):
-            rows.append({"block": block, "variant": name, "error": (res or {}).get("error", "")[:200]})
+            err = (res or {}).get("error", "") or "нет времени"
+            rows.append({"block": block, "variant": name, "error": str(err).splitlines()[0][:200]})
             continue
+        # сравнение на тех же фолдах; у обрезанного прогона — только на пройденных
+        done = res.get("folds_done") or list(range(len(res["fold_scores"])))
         a = np.asarray(res["fold_scores"])
-        b = np.asarray(base["fold_scores"])
+        b = np.asarray(base["fold_scores"])[done]
         d = (a - b) * (1 if gib else -1)
         se = float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else 0.0
         row = {"block": block, "variant": name, "delta_gain": float(d.mean()), "se": se, "mean": res["mean"],
-               "patch": patch}
+               "patch": patch, "truncated": bool(res.get("truncated")), "folds_done": done}
         rows.append(row)
-        if d.mean() > max(se, 0) and (d > 0).sum() >= math.ceil(0.6 * len(d)):
+        if not row["truncated"] and d.mean() > max(se, 0) and (d > 0).sum() >= math.ceil(0.6 * len(d)):
             improving.append(row)
     sens = {}
     for r in rows:
-        if "delta_gain" in r:
+        if "delta_gain" in r and not r.get("truncated"):
             sens[r["block"]] = max(sens.get(r["block"], 0.0), abs(r["delta_gain"]))
     focus = max(sens, key=sens.get) if sens else None
     lines = [f"Абляции узла {node.id} (быстрый режим, база {base['mean']:.6g}; Δ>0 — вариант лучше базы):"]
     for r in rows:
         if "delta_gain" in r:
-            lines.append(f"  [{r['block']}] {r['variant']}: Δ={r['delta_gain']:+.4g} ± {r['se']:.2g}")
+            note = (f" (обрезан по времени, фолды {[k + 1 for k in r['folds_done']]})" if r.get("truncated") else "")
+            lines.append(f"  [{r['block']}] {r['variant']}: Δ={r['delta_gain']:+.4g} ± {r['se']:.2g}{note}")
         else:
-            lines.append(f"  [{r['block']}] {r['variant']}: ошибка")
+            lines.append(f"  [{r['block']}] {r['variant']}: ошибка — {r.get('error', '')}")
     if focus:
         lines.append(f"Самый чувствительный блок: {focus}")
     return {"rows": rows, "text": "\n".join(lines), "focus": focus, "improving": improving, "base": base}

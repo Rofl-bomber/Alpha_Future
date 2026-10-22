@@ -4,7 +4,7 @@
 Ответ модели очищается от блоков размышлений. JSON: сначала response_format (если сервер
 умеет), затем извлечение блока, починка и проверка pydantic-схемой с повторным запросом.
 Если лимит токенов на прогон исчерпан — LLMBudgetExceeded, оркестратор переходит
-на детерминированные операторы.
+на детерминированные операторы. В режиме AGENT_UNLIMITED лимитов токенов нет.
 """
 
 import ast
@@ -104,6 +104,8 @@ class LLMClient:
             self.total_out += pout
 
     def budget_left(self) -> bool:
+        if self.cfg.unlimited:
+            return True
         return (self.total_in + self.total_out) < self.cfg.token_limit_total and self.total_out < self.cfg.token_limit_out
 
     def _log(self, rec):
@@ -114,12 +116,29 @@ class LLMClient:
             pass
 
     # ------------------------------------------------------------------ вызовы
-    def chat(self, messages, role: str, max_tokens: int = 4000, temperature=None, json_mode=False,
+    def _time_left(self, timeout):
+        """Сколько секунд можно ждать ответа. В режиме без ограничений — до дедлайна вызывающей стороны."""
+        t_left = float("inf") if self.cfg.unlimited else self.cfg.llm_timeout_s
+        if self.deadline_fn:
+            t_left = min(t_left, self.deadline_fn() - time.time())
+        if timeout:
+            t_left = min(t_left, timeout)
+        return t_left
+
+    def chat(self, messages, role: str, max_tokens: int | None = 4000, temperature=None, json_mode=False,
              thinking=None, timeout=None) -> str:
+        """Один ответ модели.
+
+        Сетевые и серверные ошибки — до cfg.llm_retries попыток с паузой. Если ответ обрезан по длине
+        (finish_reason="length") или пуст, делается ровно один повтор: без размышлений и, если лимит
+        длины задан, с удвоенным max_tokens. В режиме AGENT_UNLIMITED max_tokens не передаётся.
+        """
         if not self.available:
             raise LLMError("LLM не настроена: нет OPENAI_MODEL или OPENAI_API_KEY")
         if not self.budget_left():
             raise LLMBudgetExceeded("исчерпан лимит токенов на прогон")
+        if self.cfg.unlimited:
+            max_tokens = None
         temperature = self.cfg.temperature if temperature is None else temperature
         key = None
         if self.cache_dir:
@@ -129,31 +148,35 @@ class LLMClient:
             if hit.exists():
                 return json.loads(hit.read_text(encoding="utf-8"))["text"]
         last_err = None
-        for attempt in range(self.cfg.llm_retries):
-            t_left = self.cfg.llm_timeout_s
-            if self.deadline_fn:
-                t_left = min(t_left, self.deadline_fn() - time.time())
-            if timeout:
-                t_left = min(t_left, timeout)
+        errors = 0
+        short_retry_done = False  # единственный повтор для обрезанного или пустого ответа
+        while True:
+            t_left = self._time_left(timeout)
             if t_left < 5:
-                raise LLMError("нет времени на вызов LLM")
-            kwargs = dict(model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+                raise LLMError((last_err + "; " if last_err else "") + "нет времени на вызов LLM")
+            kwargs = dict(model=self.model, messages=messages, temperature=temperature)
+            if max_tokens:
+                kwargs["max_tokens"] = int(max_tokens)
             extra = {}
             if json_mode and self.json_mode_ok is not False:
                 kwargs["response_format"] = {"type": "json_object"}
             if thinking is False and self.thinking_ctrl_ok is not False:
+                # vLLM/SGLang читают chat_template_kwargs, часть облачных провайдеров — enable_thinking
                 extra["chat_template_kwargs"] = {"enable_thinking": False}
+                extra["enable_thinking"] = False
             if extra:
                 kwargs["extra_body"] = extra
             t0 = time.time()
             try:
-                resp = self.client.with_options(timeout=t_left).chat.completions.create(**kwargs)
+                timeout_s = None if t_left == float("inf") else t_left
+                resp = self.client.with_options(timeout=timeout_s).chat.completions.create(**kwargs)
             except Exception as e:  # noqa: BLE001
                 dt = time.time() - t0
                 name = type(e).__name__
-                msg = str(e)[:300]
+                last_err = f"{name}: {str(e)[:300]}"
                 self._account(role, 0, 0, dt, ok=False)
-                last_err = f"{name}: {msg}"
+                self._log({"t": round(t0, 1), "role": role, "dt": round(dt, 1), "error": last_err,
+                           "max_tokens": max_tokens, "thinking": thinking})
                 if name == "BadRequestError":
                     changed = False
                     if "response_format" in kwargs and self.json_mode_ok is not True:
@@ -167,36 +190,57 @@ class LLMClient:
                     raise LLMError(last_err)
                 if name in ("AuthenticationError", "PermissionDeniedError", "NotFoundError"):
                     raise LLMError(last_err)
-                time.sleep(min(20.0, 2.0 * (2 ** attempt)))
+                errors += 1
+                if errors >= self.cfg.llm_retries:
+                    raise LLMError(last_err)
+                time.sleep(min(20.0, 2.0 * (2 ** (errors - 1))))
                 continue
             dt = time.time() - t0
             if "response_format" in kwargs:
                 self.json_mode_ok = True
             if "extra_body" in kwargs:
                 self.thinking_ctrl_ok = True
-            msg = resp.choices[0].message
-            text = strip_think(msg.content or "")
+            choice = resp.choices[0]
+            msg = choice.message
+            finish = getattr(choice, "finish_reason", None)
+            raw = msg.content or ""
+            text = strip_think(raw)
+            reasoning = getattr(msg, "reasoning_content", None) or ""
             usage = getattr(resp, "usage", None)
             pin = getattr(usage, "prompt_tokens", 0) or 0
             pout = getattr(usage, "completion_tokens", 0) or 0
+            details = getattr(usage, "completion_tokens_details", None)
+            r_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
             self._account(role, pin, pout, dt)
             self._log({"t": round(t0, 1), "role": role, "dt": round(dt, 1), "in": pin, "out": pout,
+                       "reasoning_tokens": r_tokens, "reasoning_chars": len(reasoning) + (len(raw) - len(text)),
+                       "finish_reason": finish, "max_tokens": max_tokens, "thinking": thinking,
                        "prompt_tail": messages[-1]["content"][-1500:], "response": text[:6000]})
-            if not text:
-                last_err = "пустой ответ"
+            truncated = finish == "length"
+            if (truncated or not text) and not short_retry_done:
+                short_retry_done = True
+                why = "обрезан по длине" if truncated else "пустой"
+                log.warning("LLM (%s): ответ %s (out=%d, finish_reason=%s) — один повтор без размышлений%s",
+                            role, why, pout, finish, f", max_tokens={2 * max_tokens}" if max_tokens else "")
+                thinking = False
+                if max_tokens:
+                    max_tokens = 2 * int(max_tokens)
+                last_err = f"ответ {why} (finish_reason={finish})"
                 continue
+            if not text:
+                raise LLMError(f"пустой ответ после повтора (finish_reason={finish}, out={pout})")
             if key:
                 (self.cache_dir / f"{key}.json").write_text(json.dumps({"text": text}, ensure_ascii=False),
                                                             encoding="utf-8")
             return text
-        raise LLMError(last_err or "LLM не ответила")
 
-    def chat_json(self, messages, role: str, schema=None, max_tokens: int = 4000, retries: int = 2, thinking=None):
+    def chat_json(self, messages, role: str, schema=None, max_tokens: int | None = 4000, retries: int = 2,
+                  thinking=None, timeout=None):
         """Вызов с ответом в JSON; при ошибке разбора или схемы — повторный запрос с текстом ошибки."""
         msgs = list(messages)
         err = None
         for _ in range(retries + 1):
-            text = self.chat(msgs, role, max_tokens=max_tokens, json_mode=True, thinking=thinking)
+            text = self.chat(msgs, role, max_tokens=max_tokens, json_mode=True, thinking=thinking, timeout=timeout)
             try:
                 obj = extract_json(text)
                 return schema.model_validate(obj) if schema is not None else obj

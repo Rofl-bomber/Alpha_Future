@@ -34,11 +34,17 @@ def space(trial) -> dict:
 
 
 class _TimeLimit:
-    def __init__(self, deadline):
+    """Останавливает обучение на дедлайне; owner.truncated = True — модель недообучена."""
+
+    def __init__(self, deadline, owner):
         self.deadline = deadline
+        self.owner = owner
 
     def after_iteration(self, info):
-        return not (self.deadline and time.time() > self.deadline)
+        if self.deadline and time.time() > self.deadline:
+            self.owner.truncated = True
+            return False
+        return True
 
 
 def _prep(X: pd.DataFrame):
@@ -66,6 +72,7 @@ class Model:
         self.deadline = deadline
         self.model = None
         self.best_iteration = None
+        self.truncated = False
 
     def fit(self, X, y, w=None, X_val=None, y_val=None):
         from catboost import CatBoostClassifier, CatBoostRegressor, Pool
@@ -93,7 +100,7 @@ class Model:
             self.model = CatBoostClassifier(loss_function="Logloss", **common)
         else:
             self.model = CatBoostClassifier(loss_function="MultiClass", **common)
-        self.model.fit(train, eval_set=eval_set, callbacks=[_TimeLimit(self.deadline)])
+        self.model.fit(train, eval_set=eval_set, callbacks=[_TimeLimit(self.deadline, self)])
         bi = self.model.get_best_iteration()
         self.best_iteration = int(bi) + 1 if bi is not None and X_val is not None else self.model.tree_count_
         return self

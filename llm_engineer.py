@@ -73,6 +73,12 @@ class Engineer:
                                                      fit_budget=60.0, n_rows=n_rows)
         return llm_prompts.CONTRACT_ESCAPE.format(n_jobs=self.cfg.n_jobs)
 
+    def _sandbox_timeout(self, deadline: float, mult: int) -> float:
+        """Таймаут песочницы: в режиме AGENT_UNLIMITED — до дедлайна реализации, иначе из конфига."""
+        if self.cfg.unlimited:
+            return max(5.0, deadline - time.time())
+        return self.cfg.sandbox_timeout_s * mult
+
     def implement(self, slot: str, slot_id: str, hypothesis: dict, deadline: float) -> dict:
         system = llm_prompts.ENGINEER_SYSTEM.format(sample_rows=self.cfg.sample_rows,
                                                     attempts=self.cfg.engineer_submit_attempts,
@@ -89,7 +95,7 @@ class Engineer:
             if time.time() > deadline:
                 return {"ok": False, "error": "время на реализацию вышло", "steps": steps}
             text = self.client.chat(messages, role="engineer", max_tokens=self.cfg.engineer_max_tokens,
-                                    thinking=thinking)
+                                    thinking=thinking, timeout=max(5.0, deadline - time.time()))
             act = parse_action(text)
             a = act["action"]
             if a == "inspect_columns":
@@ -97,10 +103,11 @@ class Engineer:
             elif a in ("run_on_sample", "submit") and not act["code"]:
                 obs = "Нет блока ```python``` с кодом. Повтори действие с полным кодом."
             elif a == "run_on_sample":
-                res = feat_sandbox.run(KIND_BY_SLOT[slot], act["code"], self.ctx, sample=True, slot_id=slot_id)
+                res = feat_sandbox.run(KIND_BY_SLOT[slot], act["code"], self.ctx, sample=True, slot_id=slot_id,
+                                       timeout=self._sandbox_timeout(deadline, 1))
                 obs = _format_result(res)
             elif a == "submit":
-                timeout = self.cfg.sandbox_timeout_s * (1 if slot == "features" else 2)
+                timeout = self._sandbox_timeout(deadline, 1 if slot == "features" else 2)
                 res = feat_sandbox.run(KIND_BY_SLOT[slot], act["code"], self.ctx, sample=(slot != "features"),
                                        slot_id=slot_id, timeout=timeout)
                 steps.append({"step": step, "action": a, "ok": res.get("ok")})

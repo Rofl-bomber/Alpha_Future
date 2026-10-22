@@ -202,6 +202,9 @@ def main():
 
     warnings.filterwarnings("ignore")
     sys.path.insert(0, str(HERE))
+    t0 = time.time()
+    print(f"== песочница {job['kind']} {job['slot_id']} ({'подвыборка' if job['sample'] else 'полные данные'})",
+          flush=True)
     try:
         res = _child(job)
     except Exception as e:  # noqa: BLE001
@@ -210,6 +213,14 @@ def main():
         lines = [ln for ln in tb.splitlines() if "<make_features>" in ln or "<custom_model>" in ln
                  or "<escape_fit_predict>" in ln or not ln.startswith("  File")]
         res = {"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": "\n".join(lines[-25:])}
+        print(tb[-3000:], flush=True)
+    if res.get("ok"):
+        bits = [f"{k}={res[k]}" for k in ("n_new", "score_on_sample", "shape") if k in res]
+        print(f"== итог: успех; {', '.join(bits)}; время {time.time() - t0:.1f} с", flush=True)
+        if res.get("notes"):
+            print("   замечания: " + "; ".join(res["notes"]), flush=True)
+    else:
+        print(f"== итог: ОШИБКА — {res.get('error')}; время {time.time() - t0:.1f} с", flush=True)
     Path(job["result_path"]).write_text(json.dumps(res, ensure_ascii=False, default=str), encoding="utf-8")
 
 
