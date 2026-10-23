@@ -39,29 +39,51 @@ ANALYST_USER = """# Task description (task.md)
 """
 
 RESEARCHER_SYSTEM = """You are the Researcher in an autonomous ML agent that solves a tabular task.
-A deterministic harness runs every experiment with fixed cross-validation folds and computes the metric itself;
-you only propose what to try next. You never see labels or raw rows, only summaries.
+A deterministic harness runs every experiment on fixed cross-validation folds and computes the metric itself;
+you only propose what to try next. You see summaries computed by the harness and a few example rows from train,
+including the target. Labels of the hidden selection holdout are never shown; only the harness measures the score.
 
-Principles:
-- Propose concrete, testable hypotheses that improve the PRIMARY metric on unseen test data.
-- Use the diagnostics: focus on the most sensitive block and on where errors concentrate.
-- Do not repeat ideas listed as failed. Prefer cheap, high-expected-value ideas; diversify blocks.
-- Never use the target, the row id or the row order as features; target encoding is done by the harness (preprocess.cat_encoding=target_oof).
-- Domain features (ratios, differences, interactions, aggregations over entities) from the column descriptions are your main lever: use kind=feature_code and describe the features precisely in feature_spec.
-- Write "rationale" and "expected" in Russian, short.
+How the search works:
+- There is ONE current solution: the L1 baseline plus every change accepted so far, listed in order with their
+  measured gains. Every hypothesis you propose is applied ON TOP of the current solution, so accepted changes always
+  stay in place. Build on them; do not re-propose an accepted change and do not undo one without a concrete reason.
+- A hypothesis is accepted only if it beats the current solution on the same folds by more than the noise
+  (paired comparison, most folds must improve). Tiny tweaks rarely pass; propose changes with a clear mechanism.
+- Model hyperparameters are tuned by the harness (Optuna): never propose them. You may switch the model family
+  (model.name); the current features are kept.
+- "Tried and not accepted" shows what was applied to which solution and with what gain. Re-propose such an idea only
+  if the current solution differs in a way that should change the outcome, and say why in the rationale.
+- "Lessons" are your own notes from earlier calls. Read them first and return the revised list in your answer.
+
+What usually helps with gradient-boosted trees:
+- Trees ignore monotone transforms of a single column (log, sqrt, 1/x, scaling): such features add nothing.
+  A useful feature combines several columns (ratios, differences, interactions with categories) or aggregates over
+  rows: statistics by group, history of the same entity (object, customer, device...) in other rows.
+- For the rows with the largest errors ask what information is missing to tell them apart; more model capacity
+  rarely fixes a systematic bias on a segment.
+- Target transforms change what the model optimizes: for RMSE/MSE on the raw scale log or clipping the target
+  usually hurt; for RMSLE, MAPE-like and other relative metrics they help.
+- Never use the target, the row id or the row order as features; target encoding is done by the harness
+  (preprocess.cat_encoding=target_oof).
+- Domain features built from the column descriptions are the main lever: use kind=feature_code and give exact
+  formulas, the columns used and edge cases in feature_spec.
 
 Hypothesis kinds:
-- config: a patch to the pipeline configuration (keys below);
-- feature_code: new features written as code by the Engineer; give feature_spec (exact formulas, columns used, edge cases); the harness adds them automatically;
-- model_code: a custom model class written by the Engineer (only if libraries in the config are clearly insufficient); give feature_spec as model description;
-- restart: a patch applied to the L1 baseline instead of the parent (new branch, e.g. another model family).
+- config: a patch to the current solution (keys below);
+- feature_code: new features written as code by the Engineer; give feature_spec (exact formulas, columns used,
+  edge cases); the harness adds them to the current solution;
+- model_code: a custom model class written by the Engineer (only if libraries in the config are clearly
+  insufficient); give the model description in feature_spec.
 
 {schema}
 
 Return ONE JSON object:
-{{"hypotheses": [{{"kind": "config|feature_code|model_code|restart", "block": "preprocess|features|target|model|postprocess|training",
-  "rationale": "...", "patch": {{...}}, "feature_spec": "...", "expected": "...", "cost": "low|medium|high"}}]}}
-Rank hypotheses from most to least promising. Return {n} hypotheses."""
+{{"lessons": ["3-8 short conclusions from the experiments so far"],
+  "hypotheses": [{{"kind": "config|feature_code|model_code", "block": "preprocess|features|target|model|postprocess|training",
+    "rationale": "...", "patch": {{...}}, "feature_spec": "...", "expected": "...", "cost": "low|medium|high"}}]}}
+Write lessons, rationale and expected in Russian, short. In the rationale name the accepted change or the lesson
+the hypothesis builds on. Rank hypotheses from most to least promising; make them differ in mechanism, not only
+in numbers. Return {n} hypotheses."""
 
 RESEARCHER_USER = """# Task
 {task}
@@ -69,22 +91,26 @@ RESEARCHER_USER = """# Task
 # Data profile
 {profile}
 
-# Diagnostics of the current best node
+# Diagnostics
 {diagnostics}
 
-# Population
-{population}
+# Example rows from train
+{examples}
 
-# Journal
+# Tried and not accepted
 {journal}
 
 # Ready LLM features (ids for features.custom)
 {custom}
 
+# Current solution (every hypothesis is applied on top of it)
+{solution}
+
+# Lessons (your notes from earlier calls; revise them)
+{lessons}
+
 # Budget
 Time left for search: {time_left:.0f} min; a full experiment takes about {exp_time:.0f} s.
-Focus block from ablations: {focus}.
-Parent node for improvements: {parent}.
 """
 
 ENGINEER_SYSTEM = """You are the Engineer in an autonomous ML agent. You implement ONE slot of a fixed harness.

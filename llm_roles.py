@@ -82,6 +82,15 @@ class Hypothesis(BaseModel):
 
 class ResearcherOut(BaseModel):
     hypotheses: list[Hypothesis]
+    lessons: list[str] = Field(default_factory=list)
+
+    @field_validator("lessons", mode="before")
+    @classmethod
+    def _lessons(cls, v):
+        if v is None:
+            return []
+        items = v if isinstance(v, list) else [v]
+        return [str(x).strip() for x in items if str(x).strip()]
 
 
 class CriticOut(BaseModel):
@@ -127,13 +136,14 @@ def analyst(client, task_md: str, rules: str, columns: str, sample: str, timeout
     return out.model_dump()
 
 
-def researcher(client, schema: str, n: int, context: dict, timeout=None) -> list:
+def researcher(client, schema: str, n: int, context: dict, timeout=None) -> dict:
+    """Гипотезы и обновлённые «уроки» Исследователя: {"hypotheses": [...], "lessons": [...]}."""
     system = llm_prompts.RESEARCHER_SYSTEM.format(schema=schema, n=n)
     user = llm_prompts.RESEARCHER_USER.format(**context)
     out = client.chat_json([{"role": "system", "content": system}, {"role": "user", "content": user}],
                            role="researcher", schema=ResearcherOut, max_tokens=client.cfg.researcher_max_tokens,
                            timeout=timeout)
-    return [h.model_dump() for h in out.hypotheses]
+    return {"hypotheses": [h.model_dump() for h in out.hypotheses], "lessons": list(out.lessons)}
 
 
 def critic_jump(client, evidence: dict, timeout=None) -> dict:

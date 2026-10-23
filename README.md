@@ -29,7 +29,7 @@ python bench/pack.py submission.zip
 | `core_` | `config`, `timer`, `orchestrator` | бюджеты и фазы, часы и дочерние процессы, конечный автомат |
 | `task_` | `spec`, `profiler`, `metrics` | TaskSpec, профиль и детектор сплита, реестр метрик |
 | `eval_` | `protocol`, `acceptance` | фолды, selection-holdout, сейф меток; критерий принятия и проверки |
-| `search_` | `population`, `scheduler`, `operators` | популяция веток, выбор оператора, патчи/Merge/Restart/библиотека |
+| `search_` | `population`, `scheduler`, `operators` | цепочка текущего решения, выбор оператора, патчи/Restart/библиотека |
 | `diag_` | `ablation`, `errors` | абляции блоков, анализ ошибок |
 | `llm_` | `client`, `roles`, `engineer`, `prompts` | клиент, Аналитик/Исследователь/Критик, ReAct-Инженер, промпты |
 | `feat_` | `builtin`, `sandbox` | операции библиотеки и кодирования; песочница для кода LLM |

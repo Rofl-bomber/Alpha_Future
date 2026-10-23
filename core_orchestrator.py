@@ -1,10 +1,14 @@
 """Оркестратор: конечный автомат фаз, решения keep/discard, лестница сабмитов.
 
 Фазы (доли бюджета от старта solution.py, см. core_config.PHASES):
-  задача и данные → L1 без LLM → диагностика → поиск по популяции → финалисты на сидах →
-  финальная сборка и выбор на selection-holdout → запись.
+  задача и данные → L1 без LLM → диагностика → поиск цепочкой от текущего решения → финалисты
+  на сидах → финальная сборка и выбор на selection-holdout → запись.
 LLM только предлагает (Аналитик, Исследователь, Инженер, Критик); метрику считает харнесс,
 решение «оставить / откатить» принимает этот модуль.
+
+Поиск: каждая гипотеза (Исследователя, библиотеки, абляций, рестарт другого семейства моделей)
+применяется к текущему решению и сравнивается с ним на тех же фолдах; принятая сразу становится
+новым текущим решением. Исследователь всегда видит текущее решение и историю принятых изменений.
 
 Бюджеты действий: в обычном режиме — оценки по времени прошлых прогонов; в режиме AGENT_UNLIMITED
 каждое действие может идти до конца своей фазы (_budget, _can_start), других ограничений нет.
@@ -41,7 +45,7 @@ import task_spec
 
 log = logging.getLogger("agent")
 
-TIME_FACTOR = {"lgbm": 1.0, "xgb": 1.5, "catboost": 2.0, "extratrees": 1.0, "linear": 0.6, "mlp": 2.0,
+TIME_FACTOR = {"lgbm": 1.0, "xgb": 1.5, "catboost": 5.0, "extratrees": 1.0, "linear": 0.6, "mlp": 2.0,
                "custom": 2.0, "escape": 3.0}
 MIN_START_S = 5.0  # AGENT_UNLIMITED: действие не начинается, если до конца фазы меньше этого
 
@@ -81,6 +85,11 @@ class Orchestrator:
         self.segments = []
         self.research_empty = 0
         self.research_skip = 0
+        self.lessons = []  # выводы Исследователя из прошлых вызовов; он сам их обновляет
+        self.restart_done = set()  # рестарты (семейство моделей, кодирование) — по одному разу за прогон
+        self.retried = set()  # узлы, «почти прошедшие» гипотезы которых уже повторены на новом решении
+        self.near_miss_used = 0
+        self.examples_cache = {}
 
     # ================================================================== точка входа
     def run(self) -> dict:
@@ -161,6 +170,7 @@ class Orchestrator:
         self.splits, self.vault = splits, vault
         splits.save(self.ctx.splits_path)
         self.y_search = data.y[splits.search_idx]
+        self.X_search = data.X_all.iloc[: data.n_train].iloc[splits.search_idx].reset_index(drop=True)
         with open(self.ctx.data_path, "wb") as f:
             pickle.dump({"X_all": data.X_all, "n_train": data.n_train, "y_search": self.y_search}, f)
         self.metric = task_metrics.metric_for(spec)
@@ -175,8 +185,7 @@ class Orchestrator:
         if adv.get("auc") is not None:
             log.info("adversarial AUC=%.3f", adv["auc"])
         self.journal = exp_journal.Journal(self.workdir / "journal.jsonl", self.gib)
-        self.pop = search_population.Population(self.cfg.population_k, self.cfg.max_per_family, self.gib,
-                                                self.cfg.freeze_after, self.cfg.seed)
+        self.pop = search_population.Population(self.gib)
         self.scheduler = search_scheduler.Scheduler(self.cfg, self.pop, self.timer, spec)
         self.library_queue = search_operators.library(spec, prof)
         self.engineer = llm_engineer.Engineer(self.llm, self.ctx, spec, data.X_all, self.columns_text, self.task_text)
@@ -238,7 +247,6 @@ class Orchestrator:
             if res.get("ok"):
                 self.l1 = node
                 self.pop.set_anchor(node)
-                self.pop.members.append(node.id)
                 self.evaluated[search_operators.config_hash(cfg)] = node.id
                 self.min_delta = eval_acceptance.noise_floor(res["fold_scores"], self.cfg)
                 self._journal(node, "anchor", mode="full")
@@ -269,10 +277,14 @@ class Orchestrator:
         self.branch_n += 1
         return f"b{self.branch_n}"
 
+    def _incumbent(self):
+        """Текущее решение: L1 плюс все принятые изменения. Все гипотезы применяются к нему."""
+        return self.pop.incumbent() or self.l1
+
     def _journal(self, node, status, mode="full", error=None, delta=None, extra=None):
         res = node.result if mode == "full" else (node.screen if mode == "screen" else node.alt)
         rec = {"node": node.id, "parent": node.parent, "op": node.op, "desc": node.desc, "status": status,
-               "mode": mode, "family": node.family, "branch": node.branch,
+               "mode": mode, "family": node.family, "branch": node.branch, "change": node.change or None,
                "patch": (node.hypothesis or {}).get("patch"), "kind": (node.hypothesis or {}).get("kind"),
                "source": (node.hypothesis or {}).get("source"), "flags": node.flags, "reason": node.reason,
                "error": (error or (res or {}).get("error") or "")[:1500] or None, "delta": delta}
@@ -357,9 +369,11 @@ class Orchestrator:
                 self.screen_cache[node.id] = abl["base"]
             for r in sorted(abl.get("improving", []), key=lambda r: -r["delta_gain"]):
                 self.queue.insert(0, {"kind": "config", "block": r["block"], "patch": r["patch"],
-                                      "rationale": f"абляция: {r['variant']} улучшила быстрый скор на {r['delta_gain']:+.4g}",
-                                      "cost": "low", "source": "ablation", "parent_id": node.id})
-        self.diag_text = "\n\n".join(texts) or self.diag_text
+                                      "rationale": f"абляция {node.id}: {r['variant']} улучшила быстрый скор на "
+                                                   f"{r['delta_gain']:+.4g}",
+                                      "cost": "low", "source": "ablation"})
+        if texts:
+            self.diag_text = f"Диагностика узла {node.id}:\n" + "\n\n".join(texts)
         (self.workdir / f"diag_{node.id}.txt").write_text(self.diag_text, encoding="utf-8")
         log.info("[%s] диагностика %s за %.0f с; фокус: %s", self.timer.stamp(), node.id, time.time() - t0,
                  self.focus)
@@ -367,37 +381,28 @@ class Orchestrator:
     # ================================================================== поиск
     def _search(self):
         while True:
-            best = self.pop.best() or self.l1
+            best = self._incumbent()
             if not self._can_start("search", max(30.0, 0.6 * self._est_time(best.family))):
                 break
-            tried = {self.pop.nodes[i].family for i in self.pop.nodes}
-            restart = [o for o in search_operators.restart_options(self.spec, tried)
-                       if self._sig({"kind": "restart", "patch": o[1]}) not in self.tried_sigs]
+            restart = [o for o in search_operators.restart_options(self.spec, self.pop.families_tried())
+                       if self._restart_key(o[1]) not in self.restart_done]
             action = self.scheduler.next(restart)
             try:
                 if action.kind == "diagnose":
-                    self._diagnose(self.pop.best() or self.l1)
+                    self._diagnose(self._incumbent())
                 elif action.kind == "escape":
                     self._op_escape()
-                elif action.kind == "merge":
-                    self._op_merge(action.payload["a"], action.payload["b"])
                 elif action.kind == "restart":
-                    desc, patch = action.payload["option"]
-                    self.tried_sigs.add(self._sig({"kind": "restart", "patch": patch}))
-                    self._evaluate_hypothesis({"kind": "restart", "block": "model", "patch": patch,
-                                               "rationale": desc, "source": "scheduler"})
+                    self._op_restart(*action.payload["option"])
                 elif action.kind == "tune":
                     self._op_tune(action.payload["node"])
                 else:
                     hyp = self._next_hypothesis()
                     if hyp is None:
-                        # гипотез нет: новая ветка другого семейства, затем Optuna лучшего узла, иначе — финал
-                        best = self.pop.best() or self.l1
+                        # гипотез нет: другое семейство моделей на текущем решении, затем Optuna, иначе — финал
+                        best = self._incumbent()
                         if restart:
-                            desc, patch = restart[0]
-                            self.tried_sigs.add(self._sig({"kind": "restart", "patch": patch}))
-                            self._evaluate_hypothesis({"kind": "restart", "block": "model", "patch": patch,
-                                                       "rationale": desc, "source": "scheduler"})
+                            self._op_restart(*restart[0])
                         elif best.id not in self.scheduler.tuned:
                             self.scheduler.tuned.add(best.id)
                             self._op_tune(best)
@@ -412,16 +417,65 @@ class Orchestrator:
         log.info("[%s] поиск завершён: %s", self.timer.stamp(), self.journal.stats())
 
     # ------------------------------------------------------------------ очередь гипотез
-    def _sig(self, hyp) -> str:
-        return json.dumps([hyp.get("kind"), hyp.get("patch"), (hyp.get("feature_spec") or "")[:300]],
+    def _sig(self, hyp, base=None) -> str:
+        """Подпись гипотезы с учётом решения, к которому её применяют: та же идея на новом решении — новая."""
+        base = base or self._incumbent().id
+        return json.dumps([base, hyp.get("kind"), hyp.get("patch"), (hyp.get("feature_spec") or "")[:300]],
                           sort_keys=True, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _restart_key(patch) -> str:
+        return json.dumps(patch, sort_keys=True, ensure_ascii=False, default=str)
+
+    # ------------------------------------------------------------------ контекст Исследователя
+    def _solution_text(self) -> str:
+        """Текущее решение и история принятых изменений — Исследователь видит это в каждом вызове."""
+        inc, l1 = self._incumbent(), self.l1
+        lines = [f"Узел {inc.id}: CV {self.spec.metric} = {inc.mean:.6g} ± {np.std(inc.fold_scores):.3g} "
+                 f"(L1 {l1.id}: {l1.mean:.6g}; {'больше' if self.gib else 'меньше'} — лучше)."]
+        chain = self.pop.lineage()
+        if chain:
+            lines.append("Принятые изменения по порядку (выигрыш к предыдущему решению; фолды с улучшением):")
+            for i, n in enumerate(chain, 1):
+                c = n.cmp or {}
+                gain = (f"выигрыш {c['mean_gain']:+.4g} ({c.get('wins')}/{c.get('k')})"
+                        if isinstance(c.get("mean_gain"), (int, float)) else "выигрыш не измерен")
+                lines.append(f"  {i}. {n.id}: {n.change} → {gain}")
+                if n.desc and n.op not in ("tune", "restart"):
+                    lines.append(f"     идея: {' '.join(n.desc.split())[:160]}")
+        else:
+            lines.append("Принятых изменений пока нет: текущее решение — это L1.")
+        lines.append("Что сейчас в пайплайне:")
+        lines.append(search_operators.state_text(inc.config, self.custom_feats, inc.result.get("n_features")))
+        return "\n".join(lines)
+
+    def _lessons_text(self) -> str:
+        if not self.lessons:
+            return "Пока нет — это первый вызов."
+        return "\n".join(f"- {x}" for x in self.lessons)
+
+    def _examples_text(self, node) -> str:
+        """Случайные строки train и строки с наибольшей ошибкой OOF узла (только поисковая часть)."""
+        if node.id in self.examples_cache:
+            return self.examples_cache[node.id]
+        try:
+            preds = self._load_preds(node) if node.result and node.result.get("preds_path") else {}
+            order = [f for f, _ in node.result.get("importance", [])] if node.result else []
+            text = diag_errors.example_rows(self.spec, self.X_search, self.y_search, preds.get("oof"),
+                                            node.result.get("post") if node.result else None,
+                                            n=self.cfg.example_rows, order=order, seed=self.cfg.seed)
+        except Exception as e:  # noqa: BLE001
+            log.warning("примеры строк не собраны: %s", e)
+            text = "нет"
+        self.examples_cache = {node.id: text}
+        return text
 
     def _research_context(self, parent):
         custom = "\n".join(f"- {k}: {v}" for k, v in self.custom_feats.items()) or "нет"
         return dict(task=self.task_text, profile=self.profile_text[:9000], diagnostics=self.diag_text[:6000],
-                    population=self.pop.summary(), journal=self.journal.summary(), custom=custom,
-                    time_left=max(0.0, self.timer.left("search")) / 60, exp_time=self._est_time(parent.family),
-                    focus=self.focus or "нет", parent=f"{parent.id} ({parent.family}): {parent.desc}")
+                    examples=self._examples_text(parent), journal=self.journal.summary(), custom=custom,
+                    solution=self._solution_text(), lessons=self._lessons_text(),
+                    time_left=max(0.0, self.timer.left("search")) / 60, exp_time=self._est_time(parent.family))
 
     def _start_research(self):
         if self.research_future is not None or not self.llm or not self.llm.available or not self.llm.budget_left():
@@ -429,7 +483,7 @@ class Orchestrator:
         if self.research_skip > 0:  # Исследователь дважды подряд не дал нового — пропускаем пару раундов
             self.research_skip -= 1
             return
-        parent = self.pop.best() or self.l1
+        parent = self._incumbent()
         ctx = self._research_context(parent)
         schema = search_operators.schema_text(self.spec, self.hints)
 
@@ -445,17 +499,22 @@ class Orchestrator:
         if fut is None:
             return
         try:
-            hyps = fut.result(timeout=wait) if wait > 0 else (fut.result() if fut.done() else None)
+            out = fut.result(timeout=wait) if wait > 0 else (fut.result() if fut.done() else None)
         except cf.TimeoutError:
             return
         except Exception as e:  # noqa: BLE001
             log.warning("Исследователь не ответил: %s", str(e)[:300])
-            hyps = []
             self.research_future = None
             return
-        if hyps is None:
+        if out is None:
             return
         self.research_future = None
+        hyps = out.get("hypotheses", []) if isinstance(out, dict) else list(out)
+        lessons = [" ".join(str(x).split())[:240] for x in (out.get("lessons") or [])] if isinstance(out, dict) else []
+        if lessons:
+            self.lessons = lessons[:8]
+            (self.workdir / "lessons.txt").write_text("\n".join(self.lessons), encoding="utf-8")
+            log.info("[%s] уроки Исследователя: %s", self.timer.stamp(), " | ".join(self.lessons)[:600])
         added = 0
         for h in hyps:
             h["source"] = "researcher"
@@ -500,16 +559,16 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ Improve / Restart
     def _evaluate_hypothesis(self, hyp):
+        """Любая гипотеза применяется к текущему решению: все принятые изменения остаются на месте."""
         kind = hyp.get("kind", "config")
-        if kind == "restart":
-            parent = self.l1
-            branch = self._new_branch()
-        else:
-            parent = self.pop.nodes.get(hyp.get("parent_id")) or self.pop.select_parent()
-            branch = parent.branch
+        parent = self._incumbent()
+        branch = self._new_branch() if kind == "restart" else parent.branch
         desc = (hyp.get("rationale") or kind)[:200]
         patch, notes = search_operators.validate_patch(hyp.get("patch") or {}, parent.config, self.spec,
-                                                       known_custom=set(self.custom_feats), hints=self.hints)
+                                                       known_custom=set(self.custom_feats), hints=self.hints,
+                                                       allow_params=hyp.get("source") != "researcher")
+        if notes:
+            log.info("патч %s: %s", hyp.get("source"), "; ".join(notes)[:300])
         if kind in ("feature_code", "model_code"):
             slot = "features" if kind == "feature_code" else "model"
             slot_id = self._slot_id("fe" if slot == "features" else "mc")
@@ -523,6 +582,7 @@ class Orchestrator:
                 if flags:
                     node = self._new_node(parent.config, parent, "improve", desc, branch, hyp)
                     node.flags, node.status, node.reason = flags, "flagged", "признак похож на утечку"
+                    node.change = f"features.custom += {slot_id} ({(hyp.get('feature_spec') or desc)[:120]})"
                     self._journal(node, "flagged", mode="none")
                     self.scheduler.feedback(False)
                     return
@@ -552,8 +612,10 @@ class Orchestrator:
             log.warning("Инженер недоступен: %s", str(e)[:200])
             return None
         if not res.get("ok"):
-            node = self._new_node(self.l1.config, self.l1, "improve", (hyp.get("rationale") or "")[:200], None, hyp)
+            parent = self._incumbent()
+            node = self._new_node(parent.config, parent, "improve", (hyp.get("rationale") or "")[:200], None, hyp)
             node.status, node.reason = "failed", "Инженер: " + str(res.get("error"))[:300]
+            node.change = f"{slot}: {(hyp.get('feature_spec') or hyp.get('rationale') or '')[:120]}"
             self._journal(node, "failed", mode="none", error=res.get("error"))
             self.scheduler.feedback(False)
             log.info("Инженер не реализовал %s: %s", slot_id, str(res.get("error"))[:200])
@@ -619,6 +681,12 @@ class Orchestrator:
             return None
         node = self._new_node(config, parent, op, desc, branch, hyp)
         self.evaluated[h] = node.id
+        if op == "escape":
+            node.change = "аварийный оператор: полный пайплайн Инженера (fit_predict) вместо пайплайна харнесса"
+        elif op == "tune":
+            node.change = f"{desc}: гиперпараметры {fam}"
+        else:
+            node.change = search_operators.describe_change(parent.config, config, self.custom_feats)
         # скрининг: дешёвая оценка на 3 фолдах, в полную оценку проходят не явно худшие
         screen_room = self.cfg.unlimited or self.timer.left("search") > 1.6 * est
         if est > self.cfg.screen_if_full_s and parent.fold_scores and screen_room:
@@ -634,7 +702,6 @@ class Orchestrator:
                 if c["mean_gain"] < -c["se"]:
                     node.status, node.reason = "screen_rejected", f"скрининг Δ={c['mean_gain']:+.4g}"
                     self._journal(node, "screen_rejected", mode="screen", delta=c["mean_gain"])
-                    self.pop.note_child(parent.id, False)
                     self.scheduler.feedback(False)
                     return node
         if not self._can_start("search", 1.05 * est):
@@ -650,12 +717,12 @@ class Orchestrator:
         if not node.result.get("ok"):
             node.status = "failed"
             self._journal(node, "failed", mode="full")
-            self.pop.note_child(parent.id, False)
             self.scheduler.feedback(False)
             log.info("[%s] %s %s: ошибка — %s", self.timer.stamp(), node.id, op,
                      str(node.result.get("error")).splitlines()[0][:200])
             return node
         cmp = self._cmp(node.result["fold_scores"], parent.fold_scores)
+        node.cmp = cmp
         accepted = cmp["accepted"]
         rel = eval_acceptance.relative_jump(node.mean, parent.mean, self.gib)
         if accepted and rel > self.cfg.jump_rel:
@@ -670,18 +737,53 @@ class Orchestrator:
             pass
         elif not accepted:
             node.flags = []
-        self.pop.note_child(parent.id, accepted)
-        joined = self.pop.consider(node) if accepted else False
+        # принятый узел становится текущим решением; escape — отдельный пайплайн, только для бленда
+        joined = bool(accepted and op != "escape")
+        if joined:
+            self.pop.accept(node)
         self._journal(node, node.status, mode="full", delta=cmp["mean_gain"],
                       extra={"wins": cmp["wins"], "se": cmp["se"], "joined": joined})
-        log.info("[%s] %s %s [%s]: CV %.6g (Δ=%+.4g ± %.2g, %d/%d фолдов) — %s%s", self.timer.stamp(), node.id, op,
-                 fam, node.mean, cmp["mean_gain"], cmp["se"], cmp["wins"], cmp["k"], node.status,
-                 " → в популяции" if joined else "")
+        log.info("[%s] %s %s [%s] на %s: %s — CV %.6g (Δ=%+.4g ± %.2g, %d/%d фолдов) — %s%s", self.timer.stamp(),
+                 node.id, op, fam, parent.id, node.change[:200], node.mean, cmp["mean_gain"], cmp["se"], cmp["wins"],
+                 cmp["k"], node.status, " → текущее решение" if joined else "")
         if accepted:
             node.flags = [f for f in node.flags if not f.startswith("jump") and f != "fast_train"]
             self._maybe_write(node)
+        if joined:
+            self._requeue_near_misses(node)
         self.scheduler.feedback(accepted)
         return node
+
+    def _requeue_near_misses(self, new_best):
+        """После принятия: повторить на новом решении «почти прошедшие» гипотезы (выигрыш > 0, но ниже порога).
+
+        Признаки Инженера не пишутся заново: в патче уже id готовых признаков.
+        """
+        left = self.cfg.near_miss_total - self.near_miss_used
+        if left <= 0:
+            return
+        cands = []
+        for n in self.pop.nodes.values():
+            c = n.cmp or {}
+            if n.status != "rejected" or n.id in self.retried or n.op in ("tune", "escape") or not c:
+                continue
+            patch = (n.hypothesis or {}).get("patch") or {}
+            if not patch or "merge" in patch:
+                continue
+            gain, se = c.get("mean_gain", 0.0), c.get("se", 0.0)
+            if gain > 0 and gain >= 0.5 * se and 2 * c.get("wins", 0) >= c.get("k", 1):
+                cands.append(n)
+        cands.sort(key=lambda n: -n.cmp["mean_gain"] / max(n.cmp["se"], 1e-12))
+        for n in cands[: min(left, self.cfg.near_miss_per_accept)]:
+            self.retried.add(n.id)
+            self.near_miss_used += 1
+            hyp = n.hypothesis or {}
+            self.queue.insert(0, {"kind": "config", "block": hyp.get("block", "features"), "patch": dict(hyp["patch"]),
+                                  "rationale": f"повтор на новом решении {new_best.id}: {n.change[:120]} "
+                                               f"(на {n.parent} было Δ={n.cmp['mean_gain']:+.4g}, "
+                                               f"{n.cmp['wins']}/{n.cmp['k']} фолдов)",
+                                  "cost": "low", "source": "near_miss"})
+            log.info("почти прошедшая гипотеза %s поставлена в очередь на %s", n.id, new_best.id)
 
     def _recheck_jump(self, node, parent, rel) -> bool:
         if not self._can_start("search", self._est_time(node.family)):
@@ -733,11 +835,12 @@ class Orchestrator:
             return False
         return True
 
-    # ------------------------------------------------------------------ Merge / Tune / Escape
-    def _op_merge(self, a, b):
-        merged, conflicts = search_operators.merge(a.config, b.config, self.l1.config)
-        desc = f"слияние {a.id}+{b.id}" + (f" (конфликты: {conflicts[:3]})" if conflicts else "")
-        self._evaluate(merged, a, "merge", desc, a.branch, {"kind": "merge", "patch": {"merge": [a.id, b.id]}})
+    # ------------------------------------------------------------------ Restart / Tune / Escape
+    def _op_restart(self, desc, patch):
+        """Другое семейство моделей (или кодирование) на текущем решении: признаки остаются."""
+        self.restart_done.add(self._restart_key(patch))
+        self._evaluate_hypothesis({"kind": "restart", "block": "model", "patch": patch, "rationale": desc,
+                                   "source": "scheduler"})
 
     def _op_tune(self, node):
         budget = self._budget("search", min(900.0, 0.2 * self.timer.left("search")))
@@ -771,7 +874,8 @@ class Orchestrator:
             return
         cfg = search_operators.apply_patch(self.l1.config, {"model.name": "escape"})
         cfg["model"]["escape_id"] = slot_id
-        self._evaluate(cfg, self.l1, "escape", hyp["rationale"], self._new_branch(), hyp)
+        # сравнивается с текущим решением, но цепочку не продолжает: это отдельный пайплайн для бленда
+        self._evaluate(cfg, self._incumbent(), "escape", hyp["rationale"], self._new_branch(), hyp)
 
     # ================================================================== финалисты
     def _final_pool(self):
@@ -884,7 +988,8 @@ class Orchestrator:
                      shift["tv"], shift["mean_gain"])
         self.writer.write(winner["te"], post, f"финал: {winner['name']}")
         self.summary.update(choice=winner["name"], holdout=report, prior_shift=shift,
-                            l1_cv=self.l1.mean, best_cv=(self.pop.best() or self.l1).mean)
+                            l1_cv=self.l1.mean, best_cv=self._incumbent().mean,
+                            accepted_chain=[f"{n.id}: {n.change}" for n in self.pop.lineage()])
         self._refit(winner, post)
 
     def _critic_final(self, cands) -> set:

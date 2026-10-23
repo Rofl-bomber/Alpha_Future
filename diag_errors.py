@@ -18,6 +18,85 @@ def analyze(spec, y, oof, post, X: pd.DataFrame, te_pred=None, prof=None) -> tup
     return {}, "Анализ ошибок для этого типа задачи не реализован."
 
 
+def _cell(v, width: int = 24) -> str:
+    try:
+        if v is None or pd.isna(v):
+            return "NaN"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, (bool, np.bool_)):
+        return str(bool(v))
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        f = float(v)
+        return str(int(f)) if f.is_integer() and abs(f) < 1e12 else f"{f:.4g}"
+    return str(v)[:width]
+
+
+def example_rows(spec, X: pd.DataFrame, y, oof=None, post=None, n: int = 5, order=None, max_cols: int = 40,
+                 seed: int = 0) -> str:
+    """Примеры строк поисковой части train для Исследователя, транспонированно.
+
+    Столбцы r* — случайные строки, e* — строки с наибольшей ошибкой OOF текущего решения.
+    Строки selection-holdout сюда не попадают: X и y — только поисковая часть.
+    """
+    y = np.asarray(y)
+    tt = spec.task_type
+    N = len(X)
+    if N == 0:
+        return "нет строк"
+    rng = np.random.default_rng(seed)
+    rand = list(rng.choice(N, size=min(n, N), replace=False))
+    worst, pred_txt, extra = [], None, None
+    names = [str(c) for c in spec.classes] if spec.classes else []
+    if oof is not None and tt in ("regression", "binary", "multiclass"):
+        p = task_metrics.apply_post(np.asarray(oof, float), tt, post)
+        if tt == "regression":
+            err = np.abs(y.astype(float) - p)
+            pred_txt = [_cell(v) for v in p]
+        else:
+            lab = task_metrics.to_labels(p, tt, post)
+            yi = y.astype(int)
+            p_true = np.where(yi == 1, p, 1 - p) if tt == "binary" else p[np.arange(N), yi]
+            err = 1 - p_true
+            pred_txt = [names[k] if k < len(names) else str(k) for k in lab]
+            extra = [f"{v:.2f}" for v in p_true]
+        worst = [int(i) for i in np.argsort(-err)[: n + len(rand)] if i not in rand][:n]
+    idx = rand + worst
+    heads = [f"r{j + 1}" for j in range(len(rand))] + [f"e{j + 1}" for j in range(len(worst))]
+
+    def target_cells():
+        if tt in ("binary", "multiclass"):
+            return [names[int(y[i])] if int(y[i]) < len(names) else str(y[i]) for i in idx]
+        if y.ndim == 2:
+            return [",".join(_cell(v, 6) for v in y[i][:4]) for i in idx]
+        return [_cell(y[i]) for i in idx]
+
+    tname = spec.targets[0] if len(spec.targets) == 1 else "+".join(spec.targets[:3])
+    rows = [(f"{tname} (таргет)", target_cells())]
+    if pred_txt is not None:
+        rows.append(("прогноз OOF", [pred_txt[i] for i in idx]))
+    if extra is not None:
+        rows.append(("p(верный класс)", [extra[i] for i in idx]))
+    cols = [c for c in (order or []) if c in X.columns]
+    cols += [c for c in X.columns if c not in cols]
+    rest = max(0, len(cols) - max_cols)
+    for c in cols[:max_cols]:
+        s = X[c]
+        rows.append((str(c), [_cell(s.iloc[i]) for i in idx]))
+    wn = min(30, max(len(r[0]) for r in rows))  # значения без выравнивания: так короче в токенах
+    out = [f"{'колонка'[:wn]:<{wn}} | " + " | ".join(heads)]
+    for name, cells in rows:
+        out.append(f"{name[:wn]:<{wn}} | " + " | ".join(cells))
+    head = (f"r1–r{len(rand)} — случайные строки train"
+            + (f", e1–e{len(worst)} — строки с наибольшей ошибкой OOF текущего решения" if worst else "")
+            + "; колонки по убыванию важности")
+    if rest:
+        out.append(f"... ещё {rest} колонок не показаны")
+    return head + "\n" + "\n".join(out)
+
+
 def _regression(spec, y, oof, post, X):
     p = task_metrics.apply_post(oof, "regression", post)
     r = y - p

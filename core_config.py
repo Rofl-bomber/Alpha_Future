@@ -111,13 +111,12 @@ class Config:
     fast_train_ratio: float = 0.3
     screen_if_full_s: float = 90.0  # скрининг включается, если полный прогон дольше
 
-    # Поиск
-    population_k: int = 4
-    max_per_family: int = 2
-    merge_every: int = 8
+    # Поиск (цепочкой от текущего решения)
     plateau_restart: int = 6
-    freeze_after: int = 4
     diagnose_every_accepted: int = 3
+    near_miss_per_accept: int = 2  # после принятия: сколько «почти прошедших» гипотез повторить на новом решении
+    near_miss_total: int = 4  # и сколько таких повторов всего за прогон
+    example_rows: int = 5  # в промпт Исследователя: столько случайных строк и столько же худших по ошибке
     tune_at_frac: float = 2 / 3
     tune_trials: int = 40  # максимум проб Optuna за один запуск Tune
     escape_min_left_s: float = 1800.0
@@ -130,8 +129,8 @@ class Config:
     token_limit_total: int = 1_200_000  # на один запуск (одну задачу); ~0,5 $ входа по ценам Qwen3.8-27B
     token_limit_out: int = 250_000  # ~0,75 $ выхода
     engineer_thinking: int = 0  # 0 — просить сервер отключить размышления у Инженера
-    researcher_max_tokens: int = 8000
-    engineer_max_tokens: int = 4000
+    researcher_max_tokens: int = 30000
+    engineer_max_tokens: int = 15000
 
     # Инженер и песочница
     react_max_steps: int = 8

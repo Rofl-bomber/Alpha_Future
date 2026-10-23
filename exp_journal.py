@@ -1,8 +1,8 @@
 """Журнал экспериментов (journal.jsonl): память агента между итерациями и материал для защиты.
 
-Одна строка на эксперимент: гипотеза, патч, скоры по фолдам, дельта к родителю, время,
-статус и ошибка. Для LLM журнал сжимается: топ результатов, последние записи,
-проваленные идеи и свежие ошибки.
+Одна строка на эксперимент: гипотеза, патч, что изменено (change), скоры по фолдам, дельта к
+родителю, время, статус и ошибка. Для LLM журнал сжимается до непринятых идей и свежих ошибок;
+принятые изменения Исследователь видит в блоке «текущее решение».
 """
 
 import json
@@ -36,30 +36,36 @@ class Journal:
         ok = [r for r in self.records if r.get("status") in status and r.get("mean") is not None]
         return max(ok, key=lambda r: self._gain(r["mean"])) if ok else None
 
-    def summary(self, k_top: int = 10, k_last: int = 6, k_failed: int = 10) -> str:
-        full = [r for r in self.records if r.get("mode") == "full" and r.get("mean") is not None
-                and not r.get("truncated")]
-        top = sorted(full, key=lambda r: -self._gain(r["mean"]))[:k_top]
-        lines = ["Лучшие эксперименты (полная оценка):"]
-        for r in top:
-            lines.append(f"  {r['node']}: {r['mean']:.6g}±{r.get('std', 0):.3g} [{r.get('status')}] "
-                         f"{r.get('op')}: {_short(r.get('desc'))}")
-        lines.append("Последние записи:")
-        for r in self.records[-k_last:]:
-            d = r.get("delta")
-            lines.append(f"  {r['node']} {r.get('op')} [{r.get('status')}]"
-                         + (f" Δ={d:+.4g}" if isinstance(d, (int, float)) else "")
-                         + f": {_short(r.get('desc'))}" + (f" — ошибка: {_short(r.get('error'), 120)}"
-                                                           if r.get('error') else ""))
-        failed = [r for r in self.records if r.get("status") in ("rejected", "screen_rejected", "failed",
-                                                                  "flagged", "invalid", "truncated")][-k_failed:]
-        if failed:
-            lines.append("Не сработало (не повторять в том же виде):")
-            for r in failed:
+    def summary(self, k_tried: int = 16, k_errors: int = 4) -> str:
+        """Что пробовали и что не принято — для Исследователя.
+
+        Принятые изменения здесь не перечисляются: они в блоке «текущее решение» (цепочка).
+        Для каждой записи — к какому решению применяли («на nXXX»), что изменили и выигрыш по фолдам.
+        """
+        tried = [r for r in self.records if r.get("status") in ("rejected", "screen_rejected", "flagged",
+                                                                 "truncated")][-k_tried:]
+        errors = [r for r in self.records if r.get("status") in ("failed", "invalid")][-k_errors:]
+        if not tried and not errors:
+            return "Пока ничего не отклонено."
+        lines = []
+        if tried:
+            lines.append("Не принято («на nXXX» — к какому решению применяли; выигрыш > 0 — лучше того решения, "
+                         "но ниже порога шума; в скобках — фолды с улучшением из всех):")
+            for r in tried:
                 d = r.get("delta")
-                lines.append(f"  - {_short(r.get('desc'), 140)} → {r.get('status')}"
-                             + (f", Δ={d:+.4g}" if isinstance(d, (int, float)) else "")
-                             + (f", {_short(r.get('reason'), 80)}" if r.get("reason") else ""))
+                k = len(r.get("fold_scores") or [])
+                gain = (f"выигрыш {d:+.4g}" + (f" ({r['wins']}/{k})" if r.get("wins") is not None and k else "")
+                        if isinstance(d, (int, float)) else "без оценки")
+                idea = _short(r.get("desc"), 90)
+                change = _short(r.get("change") or r.get("desc"), 220)
+                lines.append(f"  - {r['node']} на {r.get('parent')}: {change} → {gain} [{r.get('status')}"
+                             + (f": {_short(r.get('reason'), 80)}" if r.get("reason") else "") + "]"
+                             + (f" — идея: {idea}" if r.get("change") and idea and idea != change else ""))
+        if errors:
+            lines.append("Не удалось выполнить:")
+            for r in errors:
+                lines.append(f"  - {r['node']}: {_short(r.get('desc'), 100)} → {r.get('status')}: "
+                             f"{_short(r.get('reason') or r.get('error'), 140)}")
         return "\n".join(lines)
 
     def stats(self) -> dict:

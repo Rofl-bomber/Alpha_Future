@@ -1,15 +1,14 @@
-"""Популяция узлов поиска: 3–5 лучших веток по CV плюс постоянный якорь L1.
+"""Узлы поиска и цепочка текущего решения.
 
 Узел = конфигурация пайплайна + артефакты слотов (код признаков, модели) + результат.
-Родитель выбирается по рангу (вероятность ∝ 1/ранг). Ветка, у которой несколько потомков
-подряд не приняты, замораживается. В популяции не больше max_per_family узлов одного
-семейства моделей — так рестарты других семейств получают место.
+Поиск идёт цепочкой: каждая гипотеза применяется к текущему решению (incumbent), а принятый
+узел сразу становится новым текущим решением. Поэтому в текущем решении всегда есть все
+принятые изменения, а цепочка L1 → … → текущее решение — их история по порядку.
+Отклонённые узлы (в том числе другие семейства моделей) хранятся для финального бленда.
 """
 
 import time
 from dataclasses import dataclass, field
-
-import numpy as np
 
 import search_operators
 
@@ -29,8 +28,8 @@ class Node:
     status: str = "pending"
     flags: list = field(default_factory=list)
     reason: str = ""
-    children_failed: int = 0
-    frozen: bool = False
+    change: str = ""  # что изменено относительно родителя, человекочитаемо
+    cmp: dict | None = None  # парное сравнение с родителем по фолдам (mean_gain, se, wins, k)
     reseed: dict | None = None
     created: float = field(default_factory=time.time)
 
@@ -48,15 +47,11 @@ class Node:
 
 
 class Population:
-    def __init__(self, k: int, max_per_family: int, greater_is_better: bool, freeze_after: int, seed: int = 0):
-        self.k = k
-        self.max_per_family = max_per_family
+    def __init__(self, greater_is_better: bool):
         self.gib = greater_is_better
-        self.freeze_after = freeze_after
         self.nodes: dict[str, Node] = {}
-        self.members: list[str] = []
         self.anchor_id: str | None = None
-        self.rng = np.random.default_rng(seed)
+        self.incumbent_id: str | None = None
         self._n = 0
 
     def new_id(self) -> str:
@@ -71,75 +66,29 @@ class Population:
 
     def set_anchor(self, node: Node):
         self.anchor_id = node.id
+        self.incumbent_id = node.id
         node.status = "anchor"
         self.register(node)
 
-    def ranked(self) -> list:
-        ids = [i for i in self.members if self.nodes[i].mean is not None]
-        return sorted((self.nodes[i] for i in ids), key=lambda n: -self.gain(n))
+    def incumbent(self) -> Node | None:
+        return self.nodes.get(self.incumbent_id) if self.incumbent_id else None
 
     def best(self) -> Node | None:
-        pool = [n for n in self.nodes.values() if n.status in ("accepted", "anchor") and n.mean is not None]
-        return max(pool, key=self.gain) if pool else None
+        """Текущее решение: принятый узел цепочки (метрика по цепочке только улучшается)."""
+        return self.incumbent()
 
-    def consider(self, node: Node) -> bool:
-        """Принятый узел входит в популяцию, если обходит худшего участника с учётом лимита на семейство."""
-        if node.mean is None:
-            return False
+    def accept(self, node: Node):
+        """Принятый узел становится текущим решением."""
         self.register(node)
-        same = [self.nodes[i] for i in self.members if self.nodes[i].family == node.family]
-        if len(same) >= self.max_per_family:
-            weakest = min(same, key=self.gain)
-            if self.gain(node) <= self.gain(weakest):
-                return False
-            self.members.remove(weakest.id)
-        if len(self.members) >= self.k:
-            weakest = min((self.nodes[i] for i in self.members), key=self.gain)
-            if self.gain(node) <= self.gain(weakest):
-                return False
-            self.members.remove(weakest.id)
-        self.members.append(node.id)
-        return True
+        self.incumbent_id = node.id
 
-    def select_parent(self) -> Node:
-        ranked = [n for n in self.ranked() if not n.frozen]
-        anchor = self.nodes.get(self.anchor_id)
-        if not ranked:
-            return anchor
-        w = np.array([1.0 / (i + 1) for i in range(len(ranked))])
-        return ranked[int(self.rng.choice(len(ranked), p=w / w.sum()))]
+    def lineage(self) -> list:
+        """Принятые изменения по порядку: узлы цепочки от L1 (не включая) до текущего решения."""
+        out, cur = [], self.incumbent()
+        while cur is not None and cur.id != self.anchor_id:
+            out.append(cur)
+            cur = self.nodes.get(cur.parent) if cur.parent else None
+        return out[::-1]
 
-    def note_child(self, parent_id: str, accepted: bool):
-        p = self.nodes.get(parent_id)
-        if p is None:
-            return
-        if accepted:
-            p.children_failed = 0
-        else:
-            p.children_failed += 1
-            if p.children_failed >= self.freeze_after and p.id in self.members and len(self.members) > 1:
-                p.frozen = True
-
-    def unfreeze_all(self):
-        for i in self.members:
-            self.nodes[i].frozen = False
-            self.nodes[i].children_failed = 0
-
-    def merge_pair(self, tried: set):
-        """Пара участников из разных веток, ещё не сливавшаяся."""
-        ranked = self.ranked()
-        for i, a in enumerate(ranked):
-            for b in ranked[i + 1:]:
-                if a.branch != b.branch and (a.id, b.id) not in tried:
-                    return a, b
-        return None
-
-    def summary(self) -> str:
-        lines = ["Популяция (лучшие ветки):"]
-        for n in self.ranked():
-            lines.append(f"  {n.id} [{n.family}, ветка {n.branch}] CV={n.mean:.6g}±{np.std(n.fold_scores):.3g}"
-                         f"{' (заморожена)' if n.frozen else ''}: {n.desc[:120]}")
-            ch = search_operators.diff(self.nodes[self.anchor_id].config, n.config) if self.anchor_id else {}
-            if ch:
-                lines.append("     отличия от L1: " + ", ".join(f"{k}={v}" for k, v in list(ch.items())[:8]))
-        return "\n".join(lines)
+    def families_tried(self) -> set:
+        return {n.family for n in self.nodes.values()}
