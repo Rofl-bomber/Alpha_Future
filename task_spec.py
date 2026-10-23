@@ -479,12 +479,18 @@ def _custom_metric_works(code: str, task_type: str) -> bool:
 # ---------------------------------------------------------------- данные для моделей
 
 
-def prepare_data(spec: TaskSpec, train: pd.DataFrame, test: pd.DataFrame) -> TaskData:
-    """Закодировать таргет, удалить строки без таргета, типизировать признаки train+test."""
+def target_mask(spec: TaskSpec, train: pd.DataFrame) -> np.ndarray:
+    """Строки сырого train с таргетом: только они идут в обучение (тот же порядок, что в TaskData)."""
     if spec.task_type in ("regression", "multi_regression", "multilabel"):
         mask = train[spec.targets].notna().all(axis=1)
     else:
         mask = train[spec.targets[0]].notna()
+    return mask.to_numpy()
+
+
+def prepare_data(spec: TaskSpec, train: pd.DataFrame, test: pd.DataFrame) -> TaskData:
+    """Закодировать таргет, удалить строки без таргета, типизировать признаки train+test."""
+    mask = pd.Series(target_mask(spec, train), index=train.index)
     spec.dropped_target_nan = int((~mask).sum())
     train = train.loc[mask].reset_index(drop=True)
 

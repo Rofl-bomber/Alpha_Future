@@ -1,53 +1,82 @@
-"""Оркестратор: конечный автомат фаз, решения keep/discard, лестница сабмитов.
+"""Оркестратор: четыре этапа, решения keep/discard, лестница сабмитов.
 
-Фазы (доли бюджета от старта solution.py, см. core_config.PHASES):
-  задача и данные → L1 без LLM → диагностика → поиск цепочкой от текущего решения → финалисты
-  на сидах → финальная сборка и выбор на selection-holdout → запись.
-LLM только предлагает (Аналитик, Исследователь, Инженер, Критик); метрику считает харнесс,
-решение «оставить / откатить» принимает этот модуль.
-
-Поиск: каждая гипотеза (Исследователя, библиотеки, абляций, рестарт другого семейства моделей)
-применяется к текущему решению и сравнивается с ним на тех же фолдах; принятая сразу становится
-новым текущим решением. Исследователь всегда видит текущее решение и историю принятых изменений.
+Этапы (границы — доли бюджета от старта solution.py, см. core_config.PHASES; границы анализа и
+L1 — потолки, следующий этап начинается сразу, как только закончился предыдущий):
+  0. TaskSpec по правилам + один JSON-вызов LLM, константный сабмит;
+  1. анализ данных: статистика харнесса → Аналитик в Python-сессии (без ограничений харнесса,
+     кроме потолка времени) → разбиение (submit_split) и отчёт; параллельно — страховочный L1;
+  2. L1: детерминированный LightGBM на разбиении Аналитика — корень цепочки поиска;
+  3. поиск: подэтапы Preprocessing → Features → Model; Исследователь (с инструментами) предлагает
+     гипотезы подэтапа, Инженер пишет код, харнесс сравнивает с текущим решением на тех же фолдах;
+     повторный вызов Аналитика после Preprocessing, после Features и на плато;
+  4. финалисты: сиды, бленд, выбор на selection-holdout, refit (без изменений).
+LLM только предлагает; метрику считает харнесс, решение «оставить / откатить» принимает этот модуль.
+Поиск жадный: принятая гипотеза сразу становится текущим решением.
 
 Бюджеты действий: в обычном режиме — оценки по времени прошлых прогонов; в режиме AGENT_UNLIMITED
-каждое действие может идти до конца своей фазы (_budget, _can_start), других ограничений нет.
-Результат, обученный не до конца из-за дедлайна (truncated), пишется в журнал со скорами по
-пройденным фолдам и дельтой к родителю, но в решениях не участвует.
+каждое действие может идти до конца своей фазы (_budget, _can_start). Результат, обученный не до
+конца из-за дедлайна (truncated), пишется в журнал, но в решениях не участвует.
 """
 
 import concurrent.futures as cf
+import copy
 import json
 import logging
 import pickle
+import shutil
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
-import diag_ablation
-import diag_errors
+import core_timer
 import eval_acceptance
 import eval_protocol
 import exp_journal
+import exp_kernel
 import exp_runner
 import final_ensemble
 import final_submission
+import llm_analyst
 import llm_client
 import llm_engineer
+import llm_researcher
 import llm_roles
 import search_operators
 import search_population
+import search_registry
 import search_scheduler
 import task_metrics
 import task_profiler
 import task_spec
+from core_config import STAGES
 
 log = logging.getLogger("agent")
 
 TIME_FACTOR = {"lgbm": 1.0, "xgb": 1.5, "catboost": 5.0, "extratrees": 1.0, "linear": 0.6, "mlp": 2.0,
                "custom": 2.0, "escape": 3.0}
 MIN_START_S = 5.0  # AGENT_UNLIMITED: действие не начинается, если до конца фазы меньше этого
+
+
+class _SubRegistry:
+    """Реестр процессов страховочного L1: виден watchdog (общий реестр), убивается отдельно."""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.own = core_timer.ProcessRegistry()
+
+    def add(self, proc):
+        self.parent.add(proc)
+        self.own.add(proc)
+
+    def remove(self, proc):
+        self.parent.remove(proc)
+        self.own.remove(proc)
+
+    def kill_all(self):
+        self.own.kill_all()
 
 
 class Orchestrator:
@@ -62,62 +91,76 @@ class Orchestrator:
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logging.getLogger("agent").addHandler(fh)
         self.writer = None
+        self.write_lock = threading.Lock()
+        self.anchor_written = False
         self.llm = None
+        self.kernel = None
+        self.reg = search_registry.Registry(self.workdir)
         self.summary = {"workdir": str(self.workdir)}
         self.queue = []
         self.tried_sigs = set()
         self.evaluated = {}
-        self.custom_feats = {}
-        self.diag_text = "Диагностика ещё не проводилась."
-        self.focus = None
+        self.codes_desc = {}  # id кода transform → что он делает (из гипотезы)
         self.best_written = None
         self.screen_cache = {}
         self.alt_cache = {}
-        self.pool = cf.ThreadPoolExecutor(max_workers=1)  # фоновый Исследователь
+        self.pool = cf.ThreadPoolExecutor(max_workers=2)  # фоновый Исследователь (устаревший вызов не мешает новому)
+        self.recall_pool = cf.ThreadPoolExecutor(max_workers=1)  # фоновый повторный вызов Аналитика
         self.sync_pool = cf.ThreadPoolExecutor(max_workers=2)  # синхронные вызовы с таймаутом
         self.research_future = None
-        self.library_queue = []
+        self.research_stage = None
+        self.recall_future = None
+        self.recall_source = "Аналитик"
         self.slot_n = 0
         self.branch_n = 0
         self.min_delta = 0.0
         self.l1 = None
         self.hints = {}
-        self.segments = []
+        self.stage = None
         self.research_empty = 0
-        self.research_skip = 0
+        self.research_fail = 0
         self.lessons = []  # выводы Исследователя из прошлых вызовов; он сам их обновляет
-        self.restart_done = set()  # рестарты (семейство моделей, кодирование) — по одному разу за прогон
-        self.retried = set()  # узлы, «почти прошедшие» гипотезы которых уже повторены на новом решении
+        self.restart_done = set()
+        self.retried = set()
         self.near_miss_used = 0
-        self.examples_cache = {}
+        self.split_source = "profiler"
+        self.insurance = None  # {"thread", "result", "ctx"}
+        self.dataset_text = "Текущий датасет ещё не построен."
+        self.columns_cur = ""
+        self.journal = None
 
     # ================================================================== точка входа
     def run(self) -> dict:
-        # (имя фазы, функция, что нужно для запуска: prep — подготовка, l1 — успешный L1)
-        steps = [("подготовка", self._prepare, None), ("L1", self._l1, "prep"),
-                 ("диагностика", self._initial_diagnosis, "l1"), ("поиск", self._search, "l1"),
-                 ("финалисты", self._reseed, "l1"), ("финал", self._final, "l1")]
+        # (имя этапа, функция, что нужно для запуска: prep — подготовка, l1 — успешный L1)
+        steps = [("TaskSpec и данные", self._prepare, None), ("анализ данных", self._analysis, "prep"),
+                 ("L1", self._l1, "prep"), ("поиск", self._search, "l1"), ("финалисты", self._reseed, "l1"),
+                 ("финал", self._final, "l1")]
         prepared = False
-        for name, fn, need in steps:
-            if (need == "prep" and not prepared) or (need == "l1" and self.l1 is None):
-                continue
-            try:
-                log.info("[%s] фаза: %s", self.timer.stamp(), name)
-                fn()
-                if name == "подготовка":
-                    prepared = True
-            except Exception as e:  # noqa: BLE001
-                log.exception("фаза «%s» прервана: %s", name, e)
-                if name == "подготовка":
-                    if self.writer is None:
-                        self._emergency_constant()
-                    break
-        self.pool.shutdown(wait=False, cancel_futures=True)
-        self.sync_pool.shutdown(wait=False, cancel_futures=True)
-        self._save_summary()
+        try:
+            for name, fn, need in steps:
+                if (need == "prep" and not prepared) or (need == "l1" and self.l1 is None):
+                    continue
+                try:
+                    log.info("[%s] этап: %s", self.timer.stamp(), name)
+                    fn()
+                    if name == "TaskSpec и данные":
+                        prepared = True
+                except Exception as e:  # noqa: BLE001
+                    log.exception("этап «%s» прерван: %s", name, e)
+                    if name == "TaskSpec и данные":
+                        if self.writer is None:
+                            self._emergency_constant()
+                        break
+        finally:
+            self._stop_insurance()
+            if self.kernel is not None:
+                self.kernel.close()
+            for p in (self.pool, self.recall_pool, self.sync_pool):
+                p.shutdown(wait=False, cancel_futures=True)
+            self._save_summary()
         return self.summary
 
-    # ================================================================== подготовка
+    # ================================================================== этап 0: TaskSpec и данные
     def _prepare(self):
         spec, train, test, dd, sample, text = task_spec.build_rules_spec(self.task_path)
         self.task_md_text = text
@@ -133,13 +176,13 @@ class Orchestrator:
                 rules = spec.to_json()[:4000]
                 cols = task_spec.dictionary_summary(spec, data)
                 sample_txt = sample.head(5).to_string() if sample is not None else "нет"
-                t_an = self._budget("l1", max(30.0, min(240.0, self.timer.left("l1") * 0.4)))
-                out = self._with_timeout(lambda: llm_roles.analyst(self.llm, text, rules, cols, sample_txt,
-                                                                   timeout=t_an), t_an)
+                t_sp = self._budget("spec", max(30.0, min(180.0, self.timer.left("spec"))))
+                out = self._with_timeout(lambda: llm_roles.spec_reader(self.llm, text, rules, cols, sample_txt,
+                                                                       timeout=t_sp), t_sp)
                 before = (spec.task_type, spec.metric, tuple(spec.classes))
                 spec = task_spec.apply_analyst(spec, out, train)
                 if (spec.task_type, spec.metric, tuple(spec.classes)) != before:
-                    log.info("Аналитик уточнил спецификацию: %s", spec.short())
+                    log.info("TaskSpec уточнён: %s", spec.short())
                     data = task_spec.prepare_data(spec, train, test)
                     self.writer = final_submission.SubmissionWriter(spec, data.test_ids, len(data.test))
                     self._write_constant()
@@ -147,10 +190,10 @@ class Orchestrator:
                     p = (self.task_path.parent / Path(str(out["output_file"])).name)
                     if p.suffix.lower() == ".csv" and p.resolve() != Path(spec.output_path) and \
                             "sample" not in p.name.lower():
-                        spec.conflicts.append(f"Аналитик предлагает файл {p.name}; пишем {spec.output_path}")
+                        spec.conflicts.append(f"LLM предлагает файл {p.name}; пишем {spec.output_path}")
                 self.spec, self.data = spec, data
             except Exception as e:  # noqa: BLE001
-                log.warning("Аналитик недоступен (%s), остаёмся на правилах", str(e)[:200])
+                log.warning("уточнение TaskSpec через LLM не удалось (%s), остаёмся на правилах", str(e)[:200])
         else:
             log.warning("LLM не настроена (нет OPENAI_MODEL/OPENAI_API_KEY): работаем без ролей LLM")
         for c in spec.conflicts:
@@ -160,27 +203,20 @@ class Orchestrator:
         const = [c for c in X.columns if X[c].nunique(dropna=True) <= 1]
         if const:
             data.X_all = X.drop(columns=const)
+        self.raw_train, self.raw_test, self.raw_dict = train, test, dd
+        self.raw_valid = task_spec.target_mask(spec, train)
         spec.save(self.ctx.spec_path)
         with open(self.ctx.data_path, "wb") as f:
             pickle.dump({"X_all": data.X_all, "n_train": data.n_train}, f)
         prof = task_profiler.profile_data(spec, data, self.cfg)
         prof["adversarial"] = task_profiler.run_adversarial(spec, prof, self.ctx)
         self.prof = prof
-        splits, vault = eval_protocol.make_splits(spec, data, prof, self.cfg)
-        self.splits, self.vault = splits, vault
-        splits.save(self.ctx.splits_path)
-        self.y_search = data.y[splits.search_idx]
-        self.X_search = data.X_all.iloc[: data.n_train].iloc[splits.search_idx].reset_index(drop=True)
-        with open(self.ctx.data_path, "wb") as f:
-            pickle.dump({"X_all": data.X_all, "n_train": data.n_train, "y_search": self.y_search}, f)
         self.metric = task_metrics.metric_for(spec)
         self.gib = self.metric.greater_is_better
-        self.profile_text = task_profiler.summary_text(spec, prof)
-        self.task_text = (f"{spec.title}\n{spec.short()}\nВалидация: {splits.describe()}\n"
-                          + ("Заметки: " + "; ".join(spec.notes[:6]) if spec.notes else ""))
-        self.columns_text = llm_engineer.columns_text(spec, data.X_all)
-        (self.workdir / "profile.txt").write_text(self.profile_text, encoding="utf-8")
-        log.info("валидация: %s", splits.describe())
+        splits, vault = eval_protocol.make_splits(spec, data, prof, self.cfg)  # запасная схема
+        self._set_splits(splits, vault)
+        self.stats_text = task_profiler.stats_text(spec, data, prof, train, test)
+        (self.workdir / "stats.txt").write_text(self.stats_text, encoding="utf-8")
         adv = prof.get("adversarial") or {}
         if adv.get("auc") is not None:
             log.info("adversarial AUC=%.3f", adv["auc"])
@@ -188,8 +224,21 @@ class Orchestrator:
         self.pop = search_population.Population(self.gib)
         self.scheduler = search_scheduler.Scheduler(self.cfg, self.pop, self.timer, spec)
         self.library_queue = search_operators.library(spec, prof)
-        self.engineer = llm_engineer.Engineer(self.llm, self.ctx, spec, data.X_all, self.columns_text, self.task_text)
-        self.summary.update(spec=spec.short(), validation=splits.describe())
+        self.engineer = llm_engineer.Engineer(self.llm, self.ctx, spec, self.task_text)
+        self.summary.update(spec=spec.short())
+        self._start_insurance()
+
+    def _set_splits(self, splits, vault):
+        self.splits, self.vault = splits, vault
+        splits.save(self.ctx.splits_path)
+        self.y_search = self.data.y[splits.search_idx]
+        with open(self.ctx.data_path, "wb") as f:
+            pickle.dump({"X_all": self.data.X_all, "n_train": self.data.n_train, "y_search": self.y_search}, f)
+        self.task_text = (f"{self.spec.title}\n{self.spec.short()}\nВалидация: {splits.describe()}\n"
+                          + ("Заметки: " + "; ".join(self.spec.notes[:6]) if self.spec.notes else ""))
+        if getattr(self, "engineer", None) is not None:
+            self.engineer.task_text = self.task_text
+        log.info("валидация: %s", splits.describe())
 
     def _write_constant(self):
         pred = final_submission.constant_pred(self.spec, self.data.y, len(self.data.test))
@@ -206,12 +255,10 @@ class Orchestrator:
         return limited
 
     def _can_start(self, phase: str, need: float) -> bool:
-        """Можно ли начать действие: в AGENT_UNLIMITED — если до конца фазы есть MIN_START_S."""
         left = self.timer.left(phase)
         return left >= MIN_START_S if self.cfg.unlimited else left >= need
 
     def _deadline(self, phase: str, limited: float) -> float:
-        """Абсолютный дедлайн действия (epoch): в AGENT_UNLIMITED — конец фазы."""
         return self.timer.deadline(phase) if self.cfg.unlimited else limited
 
     def _emergency_constant(self):
@@ -225,15 +272,112 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             log.error("не удалось записать даже константный сабмит: %s", e)
 
-    # ================================================================== L1
+    # ------------------------------------------------------------------ страховочный L1
+    def _start_insurance(self):
+        """L1 на запасной схеме в фоне, пока идёт анализ: сабмит на случай долгого анализа."""
+        ins_dir = self.workdir / "insurance"
+        ins_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("spec.json", "data.pkl", "splits.npz"):
+            shutil.copy(self.workdir / name, ins_dir / name)
+        cfg = copy.copy(self.cfg)
+        cfg.n_jobs = max(1, self.cfg.n_jobs - (self.cfg.kernel_threads if self.llm.available else 0))
+        ctx = exp_runner.RunContext(ins_dir, cfg, self.timer, _SubRegistry(self.registry))
+        state = {"result": None, "ctx": ctx, "config": search_operators.default_config(self.spec)}
+
+        def work():
+            budget = max(60.0, self.timer.left("l1"))
+            res = exp_runner.run_experiment("ins_l1", state["config"], ctx, "full", budget_s=budget)
+            state["result"] = res
+            if res.get("ok") and not res.get("truncated"):
+                with self.write_lock:
+                    if not self.anchor_written:
+                        te = np.load(res["preds_path"])["te"]
+                        self.writer.write(te, res.get("post"), "страховочный L1", res["mean"])
+                log.info("[%s] страховочный L1: CV %.6g за %.0f с", self.timer.stamp(), res["mean"], res["time_s"])
+            else:
+                log.info("страховочный L1 не удался: %s", str(res.get("error"))[:200])
+
+        t = threading.Thread(target=work, daemon=True, name="insurance-l1")
+        state["thread"] = t
+        self.insurance = state
+        t.start()
+
+    def _stop_insurance(self):
+        ins = self.insurance
+        if ins and ins["thread"].is_alive():
+            ins["ctx"].registry.kill_all()
+            ins["thread"].join(timeout=10)
+
+    # ================================================================== этап 1: анализ данных
+    def _kernel_conf(self) -> dict:
+        s = self.spec
+        return {"paths": {"train": s.train_path, "test": s.test_path, "dict": s.dict_path, "sample": s.sample_path},
+                "targets": list(s.targets), "id_col": s.id_col, "task_type": s.task_type, "n_classes": s.n_classes,
+                "workdir": str(self.workdir), "holdout_min": self.cfg.holdout_min_frac,
+                "holdout_max": self.cfg.holdout_max_frac, "seed": self.cfg.seed,
+                "step_timeout": self.cfg.analysis_step_timeout_s, "max_out": self.cfg.analysis_max_out,
+                "threads": self.cfg.kernel_threads}
+
+    def _analysis(self):
+        if not self.llm.available:
+            log.info("анализ данных пропущен: LLM недоступна — запасная схема валидации профайлера")
+            return
+        try:
+            self.kernel = exp_kernel.Kernel(self.ctx, self._kernel_conf(), log)
+            self.kernel.start()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Python-сессия Аналитика не запустилась: %s — анализ пропущен", str(e)[:300])
+            self.kernel = None
+            return
+        files = [f"train: {self.raw_train.shape[0]} строк × {self.raw_train.shape[1]} колонок ({Path(self.spec.train_path).name})",
+                 f"test: {self.raw_test.shape[0]} × {self.raw_test.shape[1]} ({Path(self.spec.test_path).name})"]
+        if self.spec.dict_path:
+            files.append(f"data_dictionary: {Path(self.spec.dict_path).name}")
+        if self.spec.sample_path:
+            files.append(f"sample_submission: {Path(self.spec.sample_path).name}")
+        spec_text = (f"{self.spec.short()}; таргет {self.spec.targets}; id {self.spec.id_col}; "
+                     f"классы {list(self.spec.classes)[:20]}")
+        deadline = self._deadline("analysis", self.timer.deadline("analysis"))
+        t0 = time.time()
+        report = llm_analyst.run_analysis(self.llm, self.kernel, self.cfg, self.workdir, self.task_md_text, spec_text,
+                                          "\n".join(files), self.stats_text, deadline)
+        if report is None:
+            log.warning("Аналитик не сдал отчёт — дальше работаем по статистике харнесса")
+        else:
+            short = llm_analyst.short_report(self.llm, self.cfg, report["part_a"])
+            self.reg.load_report(report, short)
+            (self.workdir / "analyst_short.md").write_text(short, encoding="utf-8")
+            log.info("[%s] Аналитик: отчёт за %.0f с, шагов %d; гипотез %d, отклонённых %d, ловушек %d",
+                     self.timer.stamp(), time.time() - t0, report["steps"], len(report["json"].get("hypotheses", [])),
+                     len(report["json"].get("rejected", [])), len(report["json"].get("traps", [])))
+        res = eval_protocol.splits_from_analyst(self.spec, self.data, self.raw_valid, self.workdir, self.cfg)
+        if res is None:
+            log.info("разбиение Аналитика не получено — остаётся запасная схема профайлера")
+            return
+        self.split_source = "analyst"
+        self._set_splits(*res)
+        self.summary.update(validation=self.splits.describe())
+
+    # ================================================================== этап 2: L1
     def _l1(self):
+        ins = self.insurance
+        if ins and ins["thread"].is_alive():
+            if self.split_source == "profiler":
+                ins["thread"].join(timeout=max(1.0, self.timer.left("l1")))
+            else:
+                self._stop_insurance()
         base = search_operators.default_config(self.spec)
+        if self.split_source == "profiler" and ins and ins.get("result") and ins["result"].get("ok") \
+                and not ins["result"].get("truncated"):
+            node = self._new_node(ins["config"], None, "anchor", "L1: LightGBM, надёжные дефолты (страховочный)", "b0")
+            node.result = ins["result"]
+            self._set_anchor(node)
+            return
         tries = [("L1: LightGBM, надёжные дефолты", base)]
         fast = search_operators.apply_patch(base, {"model.params": {"learning_rate": 0.15, "n_estimators": 600}})
         tries.append(("L1: LightGBM, быстрый", fast))
         tries.append(("L1: ExtraTrees", search_operators.apply_patch(base, {"model.name": "extratrees"})))
         for desc, cfg in tries:
-            # L1 обязателен: в AGENT_UNLIMITED он может идти до конца фазы поиска
             budget = self._budget("search", max(60.0, self.timer.left("reseed") * 0.5))
             node = self._new_node(cfg, None, "anchor", desc, branch="b0")
             res = exp_runner.run_experiment(node.id, cfg, self.ctx, "full", budget_s=budget)
@@ -241,35 +385,77 @@ class Orchestrator:
             if res.get("ok") and res.get("truncated"):
                 node.status, node.reason = "truncated", f"обучение остановлено по дедлайну: {res.get('stop_reason')}"
                 self._journal(node, "truncated", mode="full")
-                log.warning("L1 (%s) обрезан по времени: CV %.6g на фолдах %s — пробую следующий вариант", desc,
-                            res["mean"], [k + 1 for k in res.get("folds_done", [])])
+                log.warning("L1 (%s) обрезан по времени — пробую следующий вариант", desc)
                 continue
             if res.get("ok"):
-                self.l1 = node
-                self.pop.set_anchor(node)
-                self.evaluated[search_operators.config_hash(cfg)] = node.id
-                self.min_delta = eval_acceptance.noise_floor(res["fold_scores"], self.cfg)
-                self._journal(node, "anchor", mode="full")
-                self._maybe_write(node, force=True)
-                self._write_hints(res)
-                log.info("[%s] L1 %s: CV %.6g ± %.3g за %.0f с", self.timer.stamp(), node.id, res["mean"],
-                         res["std"], res["time_s"])
+                self._set_anchor(node)
                 return
             node.status = "failed"
             self._journal(node, "failed", mode="full", error=res.get("error"))
             log.warning("L1 (%s) не удался: %s", desc, str(res.get("error"))[:500])
+        if ins and ins.get("result") and ins["result"].get("ok") and not ins["result"].get("truncated"):
+            log.warning("якорный L1 не получился — запасная схема и страховочный L1 как якорь")
+            splits, vault = eval_protocol.make_splits(self.spec, self.data, self.prof, self.cfg)
+            self.split_source = "profiler"
+            self._set_splits(splits, vault)
+            node = self._new_node(ins["config"], None, "anchor", "L1 (страховочный)", "b0")
+            node.result = ins["result"]
+            self._set_anchor(node)
 
-    def _write_hints(self, res):
+    def _set_anchor(self, node):
+        res = node.result
+        self.l1 = node
+        self.pop.set_anchor(node)
+        self.evaluated[search_operators.config_hash(node.config)] = node.id
+        self.min_delta = eval_acceptance.noise_floor(res["fold_scores"], self.cfg)
+        self._journal(node, "anchor", mode="full")
+        with self.write_lock:
+            self.anchor_written = True
+            self._maybe_write(node, force=True)
         nums = set(self.spec.num_cols)
-        top = [f for f, _ in res.get("importance", []) if f in nums][:10]
-        self.hints = {"top_num": top}
+        self.hints = {"top_num": [f for f, _ in res.get("importance", []) if f in nums][:10]}
         self.ctx.hints_path.write_text(json.dumps(self.hints, ensure_ascii=False), encoding="utf-8")
+        log.info("[%s] L1 %s: CV %.6g ± %.3g за %.0f с", self.timer.stamp(), node.id, res["mean"], res["std"],
+                 res["time_s"])
+        self._refresh_current(node)
+
+    # ------------------------------------------------------------------ текущие данные решения (D3)
+    def _refresh_current(self, node):
+        """Текущие данные решения: цепочка на строках поиска → статистика D3, данные в сессию, колонки Инженеру."""
+        out_dir = self.workdir / "current"
+        res = exp_runner.run_job({"kind": "materialize", "config": node.config, "out_dir": str(out_dir)}, self.ctx,
+                                 timeout=self._budget("search", max(60.0, min(600.0, 0.1 * self.timer.left("search")))),
+                                 tag=f"{node.id}_materialize")
+        if not res.get("ok"):
+            log.warning("текущие данные решения не построены: %s", str(res.get("error"))[:300])
+            return
+        try:
+            tr = pd.read_pickle(res["train_path"])
+            te = pd.read_pickle(res["test_path"])
+            self.dataset_text = task_profiler.current_stats(tr, te, list(self.spec.feature_cols),
+                                                            node.result.get("importance"))
+            self.columns_cur = llm_engineer.columns_text(tr, self.spec)
+            (self.workdir / "dataset_current.txt").write_text(self.dataset_text, encoding="utf-8")
+            if self.kernel is not None:
+                pos = np.where(self.raw_valid)[0]
+                np.save(out_dir / "y_search.npy", np.asarray(self.y_search))
+                np.save(out_dir / "search_rows.npy", pos[self.splits.search_idx])
+                np.save(out_dir / "holdout_rows.npy", pos[self.splits.holdout_idx])
+                items = {"cur_train": res["train_path"], "cur_test": res["test_path"],
+                         "y_search": str(out_dir / "y_search.npy"), "search_rows": str(out_dir / "search_rows.npy"),
+                         "holdout_rows": str(out_dir / "holdout_rows.npy")}
+                if node.result.get("preds_path"):
+                    np.save(out_dir / "oof.npy", np.load(node.result["preds_path"])["oof"])
+                    items["oof"] = str(out_dir / "oof.npy")
+                self.kernel.load(items)
+        except Exception as e:  # noqa: BLE001
+            log.warning("текущие данные решения не загружены: %s", str(e)[:300])
 
     # ================================================================== узлы и журнал
     def _new_node(self, config, parent, op, desc, branch=None, hyp=None):
         node = search_population.Node(id=self.pop.new_id(), config=config, parent=parent.id if parent else None,
                                       op=op, desc=desc, branch=branch or (parent.branch if parent else "b0"),
-                                      hypothesis=hyp)
+                                      hypothesis=hyp, stage=self.stage or "")
         self.pop.register(node)
         return node
 
@@ -283,10 +469,11 @@ class Orchestrator:
 
     def _journal(self, node, status, mode="full", error=None, delta=None, extra=None):
         res = node.result if mode == "full" else (node.screen if mode == "screen" else node.alt)
-        rec = {"node": node.id, "parent": node.parent, "op": node.op, "desc": node.desc, "status": status,
-               "mode": mode, "family": node.family, "branch": node.branch, "change": node.change or None,
-               "patch": (node.hypothesis or {}).get("patch"), "kind": (node.hypothesis or {}).get("kind"),
-               "source": (node.hypothesis or {}).get("source"), "flags": node.flags, "reason": node.reason,
+        hyp = node.hypothesis or {}
+        rec = {"node": node.id, "parent": node.parent, "op": node.op, "stage": node.stage, "ref": hyp.get("ref"),
+               "desc": node.desc, "status": status, "mode": mode, "family": node.family, "branch": node.branch,
+               "change": node.change or None, "patch": hyp.get("patch"), "kind": hyp.get("kind"),
+               "source": hyp.get("source"), "flags": node.flags, "reason": node.reason,
                "error": (error or (res or {}).get("error") or "")[:1500] or None, "delta": delta}
         if res and res.get("ok"):
             rec.update(fold_scores=res["fold_scores"], mean=res["mean"], std=res["std"], time_s=res["time_s"],
@@ -294,11 +481,13 @@ class Orchestrator:
         if res:
             rec.update(truncated=bool(res.get("truncated")), folds_done=res.get("folds_done"),
                        stop_reason=res.get("stop_reason"), budget_s=res.get("budget_s"))
-        elif res and res.get("wall_s") and (res.get("timed_out") or "исчерпан" in str(res.get("error", ""))):
-            rec["time_s"] = res["wall_s"]  # прогон не уложился в бюджет — оценка времени семейства растёт
+            if not res.get("ok") and res.get("wall_s") and (res.get("timed_out") or "исчерпан" in str(res.get("error"))):
+                rec["time_s"] = res["wall_s"]  # прогон не уложился в бюджет — оценка времени семейства растёт
         if extra:
             rec.update(extra)
         self.journal.add(rec)
+        if hyp.get("ref") and status not in ("anchor",):
+            self.reg.on_result(hyp.get("ref"), node.id, status, delta, node.stage)
 
     def _load_preds(self, node, mode="full"):
         res = node.result if mode == "full" else node.screen
@@ -322,131 +511,104 @@ class Orchestrator:
         base = self.l1.result["time_s"] if self.l1 and self.l1.result else 60.0
         return base * TIME_FACTOR.get(family, 1.5)
 
-    # ================================================================== диагностика
-    def _initial_diagnosis(self):
-        limited = max(self.timer.deadline("diag"), time.time() + 0.08 * max(0.0, self.timer.left("search")))
-        self._diagnose(self.l1, phase_deadline=self._deadline("search", limited))
-        self.scheduler.diag_pending = False
-        # сегменты с крупнейшими ошибками фиксируются один раз, до поиска: признаки узлов не меняются по ходу
-        if self.segments:
-            self.hints["segments"] = self.segments[:5]
-            self.ctx.hints_path.write_text(json.dumps(self.hints, ensure_ascii=False), encoding="utf-8")
-            self.library_queue.insert(0, {"kind": "config", "block": "features", "cost": "low", "source": "library",
-                                          "rationale": f"флаги сегментов с крупнейшими ошибками {self.segments[:5]}",
-                                          "patch": {"features.builtin": "+segment_flags"}})
+    @staticmethod
+    def _chain_len(config) -> int:
+        return len(config.get("features", {}).get("chain", []) or [])
 
-    def _diagnose(self, node, phase_deadline=None):
-        if node is None or node.mean is None:
-            return
-        t0 = time.time()
-        deadline = phase_deadline or self._deadline("search",
-                                                    time.time() + min(0.12 * self.timer.left("search"), 900.0))
-        est = 0.0 if self.cfg.unlimited else self._est_time(node.family) * 0.45
-        texts = []
-        try:
-            preds = self._load_preds(node)
-            Xs = self.data.X_all.iloc[: self.data.n_train].iloc[self.splits.search_idx].reset_index(drop=True)
-            err, err_text = diag_errors.analyze(self.spec, self.y_search, preds["oof"], node.result.get("post"), Xs,
-                                                preds.get("te"), self.prof)
-            if node is self.l1 and not self.segments:
-                self.segments = [list(sg) for sg in err.get("segments", [])]
-            texts.append("Анализ ошибок:\n" + err_text)
-        except Exception as e:  # noqa: BLE001
-            log.warning("анализ ошибок не удался: %s", e)
+    def _exp(self, node_id, config, mode, budget, cache_from=None, seeds=(0,)):
+        """Эксперимент с кэшем принятой части цепочки transform (cache_from — конфиг, чья цепочка принята)."""
+        upto = self._chain_len(cache_from if cache_from is not None else config)
+        extra = {"cache_upto": upto, "cache_max_gb": self.cfg.cache_max_gb} if upto else None
+        return exp_runner.run_experiment(node_id, config, self.ctx, mode, seeds=seeds, budget_s=budget, extra=extra)
 
-        def screen(cfg, tag):
-            left = deadline - time.time()
-            if left < (MIN_START_S if self.cfg.unlimited else 10.0):
-                return None
-            budget = left if self.cfg.unlimited else min(max(30.0, left), max(60.0, est * 3))
-            return exp_runner.run_experiment(tag, cfg, self.ctx, "screen", budget_s=budget)
-
-        if deadline - time.time() > est:
-            abl = diag_ablation.run(node, self.spec, self.prof, screen, self.gib, lambda: deadline - time.time(), est)
-            texts.insert(0, abl["text"])
-            self.focus = abl.get("focus")
-            if abl.get("base"):
-                self.screen_cache[node.id] = abl["base"]
-            for r in sorted(abl.get("improving", []), key=lambda r: -r["delta_gain"]):
-                self.queue.insert(0, {"kind": "config", "block": r["block"], "patch": r["patch"],
-                                      "rationale": f"абляция {node.id}: {r['variant']} улучшила быстрый скор на "
-                                                   f"{r['delta_gain']:+.4g}",
-                                      "cost": "low", "source": "ablation"})
-        if texts:
-            self.diag_text = f"Диагностика узла {node.id}:\n" + "\n\n".join(texts)
-        (self.workdir / f"diag_{node.id}.txt").write_text(self.diag_text, encoding="utf-8")
-        log.info("[%s] диагностика %s за %.0f с; фокус: %s", self.timer.stamp(), node.id, time.time() - t0,
-                 self.focus)
-
-    # ================================================================== поиск
+    # ================================================================== этап 3: поиск
     def _search(self):
+        for i, _ in enumerate(STAGES):
+            if not self._can_start("search", 30.0):
+                break
+            self.stage = self.scheduler.enter(i)
+            self.queue = [h for h in self.queue if h.get("stage") == self.stage]
+            self.research_empty = 0
+            if self.research_future is not None and self.research_stage != self.stage:
+                self.research_future = None  # ответ для прошлого подэтапа не ждём: он будет отброшен
+            log.info("[%s] подэтап поиска: %s (до %.0f мин от старта)", self.timer.stamp(), self.stage,
+                     (self.scheduler.stage_end - self.timer.t0) / 60)
+            self._stage_loop()
+            self._collect_recall(wait=0.0)
+            if self.stage != "model" and self._can_start("search", 120.0):
+                self._recall(blocking=True, reason=f"завершён подэтап {self.stage}; дальше — {STAGES[i + 1]}")
+        log.info("[%s] поиск завершён: %s", self.timer.stamp(), self.journal.stats())
+
+    def _stage_loop(self):
         while True:
             best = self._incumbent()
             if not self._can_start("search", max(30.0, 0.6 * self._est_time(best.family))):
-                break
-            restart = [o for o in search_operators.restart_options(self.spec, self.pop.families_tried())
-                       if self._restart_key(o[1]) not in self.restart_done]
-            action = self.scheduler.next(restart)
+                return
+            action = self.scheduler.next()
             try:
-                if action.kind == "diagnose":
-                    self._diagnose(self._incumbent())
-                elif action.kind == "escape":
+                if action.kind == "advance":
+                    log.info("[%s] подэтап %s завершён: %s", self.timer.stamp(), self.stage, action.payload.get("why"))
+                    return
+                if action.kind == "recall":
+                    self._recall(blocking=False, reason=f"{action.payload.get('why')} в подэтапе {self.stage}")
+                    continue
+                if action.kind == "escape":
                     self._op_escape()
-                elif action.kind == "restart":
-                    self._op_restart(*action.payload["option"])
-                elif action.kind == "tune":
+                    continue
+                if action.kind == "tune":
                     self._op_tune(action.payload["node"])
-                else:
-                    hyp = self._next_hypothesis()
-                    if hyp is None:
-                        # гипотез нет: другое семейство моделей на текущем решении, затем Optuna, иначе — финал
+                    continue
+                hyp = self._next_hypothesis()
+                if hyp is None:
+                    if self.stage == "model":
+                        restart = [o for o in search_operators.restart_options(self.spec, self.pop.families_tried())
+                                   if self._restart_key(o[1]) not in self.restart_done]
                         best = self._incumbent()
                         if restart:
                             self._op_restart(*restart[0])
-                        elif best.id not in self.scheduler.tuned:
+                            continue
+                        if best.id not in self.scheduler.tuned:
                             self.scheduler.tuned.add(best.id)
                             self._op_tune(best)
-                        else:
-                            log.info("гипотезы закончились")
-                            break
-                        continue
-                    self._evaluate_hypothesis(hyp)
+                            continue
+                    log.info("[%s] гипотезы подэтапа %s закончились", self.timer.stamp(), self.stage)
+                    return
+                self._evaluate_hypothesis(hyp)
+                self._collect_recall(wait=0.0)
             except Exception as e:  # noqa: BLE001
-                log.exception("ошибка в операторе %s: %s", action.kind, e)
+                log.exception("ошибка в действии %s: %s", action.kind, e)
                 self.scheduler.feedback(False)
-        log.info("[%s] поиск завершён: %s", self.timer.stamp(), self.journal.stats())
 
     # ------------------------------------------------------------------ очередь гипотез
     def _sig(self, hyp, base=None) -> str:
         """Подпись гипотезы с учётом решения, к которому её применяют: та же идея на новом решении — новая."""
         base = base or self._incumbent().id
-        return json.dumps([base, hyp.get("kind"), hyp.get("patch"), (hyp.get("feature_spec") or "")[:300]],
-                          sort_keys=True, ensure_ascii=False, default=str)
+        return json.dumps([base, hyp.get("stage") or self.stage, hyp.get("kind"), hyp.get("patch"),
+                           (hyp.get("spec") or "")[:300]], sort_keys=True, ensure_ascii=False, default=str)
 
     @staticmethod
     def _restart_key(patch) -> str:
         return json.dumps(patch, sort_keys=True, ensure_ascii=False, default=str)
 
-    # ------------------------------------------------------------------ контекст Исследователя
     def _solution_text(self) -> str:
-        """Текущее решение и история принятых изменений — Исследователь видит это в каждом вызове."""
+        """D1: текущее решение и история принятых изменений."""
         inc, l1 = self._incumbent(), self.l1
         lines = [f"Узел {inc.id}: CV {self.spec.metric} = {inc.mean:.6g} ± {np.std(inc.fold_scores):.3g} "
                  f"(L1 {l1.id}: {l1.mean:.6g}; {'больше' if self.gib else 'меньше'} — лучше)."]
         chain = self.pop.lineage()
         if chain:
-            lines.append("Принятые изменения по порядку (выигрыш к предыдущему решению; фолды с улучшением):")
+            lines.append("Принятые изменения по порядку (подэтап; выигрыш к предыдущему решению; фолды с улучшением):")
             for i, n in enumerate(chain, 1):
                 c = n.cmp or {}
                 gain = (f"выигрыш {c['mean_gain']:+.4g} ({c.get('wins')}/{c.get('k')})"
                         if isinstance(c.get("mean_gain"), (int, float)) else "выигрыш не измерен")
-                lines.append(f"  {i}. {n.id}: {n.change} → {gain}")
+                lines.append(f"  {i}. {n.id} [{n.stage}]: {n.change} → {gain}" + (f" (проверка {n.ref})" if n.ref else ""))
                 if n.desc and n.op not in ("tune", "restart"):
                     lines.append(f"     идея: {' '.join(n.desc.split())[:160]}")
         else:
             lines.append("Принятых изменений пока нет: текущее решение — это L1.")
         lines.append("Что сейчас в пайплайне:")
-        lines.append(search_operators.state_text(inc.config, self.custom_feats, inc.result.get("n_features")))
+        lines.append(search_operators.state_text(inc.config, self.codes_desc, inc.result.get("n_features")))
         return "\n".join(lines)
 
     def _lessons_text(self) -> str:
@@ -454,44 +616,35 @@ class Orchestrator:
             return "Пока нет — это первый вызов."
         return "\n".join(f"- {x}" for x in self.lessons)
 
-    def _examples_text(self, node) -> str:
-        """Случайные строки train и строки с наибольшей ошибкой OOF узла (только поисковая часть)."""
-        if node.id in self.examples_cache:
-            return self.examples_cache[node.id]
-        try:
-            preds = self._load_preds(node) if node.result and node.result.get("preds_path") else {}
-            order = [f for f, _ in node.result.get("importance", [])] if node.result else []
-            text = diag_errors.example_rows(self.spec, self.X_search, self.y_search, preds.get("oof"),
-                                            node.result.get("post") if node.result else None,
-                                            n=self.cfg.example_rows, order=order, seed=self.cfg.seed)
-        except Exception as e:  # noqa: BLE001
-            log.warning("примеры строк не собраны: %s", e)
-            text = "нет"
-        self.examples_cache = {node.id: text}
-        return text
+    def _short_text(self) -> str:
+        if self.reg.short:
+            return self.reg.short
+        return "Отчёта Аналитика нет. Статистика харнесса по сырым данным:\n" + self.stats_text[:6000]
 
     def _research_context(self, parent):
-        custom = "\n".join(f"- {k}: {v}" for k, v in self.custom_feats.items()) or "нет"
-        return dict(task=self.task_text, profile=self.profile_text[:9000], diagnostics=self.diag_text[:6000],
-                    examples=self._examples_text(parent), journal=self.journal.summary(), custom=custom,
-                    solution=self._solution_text(), lessons=self._lessons_text(),
-                    time_left=max(0.0, self.timer.left("search")) / 60, exp_time=self._est_time(parent.family))
+        return dict(task=self.task_text, analyst_json=self.reg.json_text(), short=self._short_text(),
+                    registry=self.reg.text_open(), solution=self._solution_text(), dataset=self.dataset_text,
+                    journal=self.journal.summary(self.stage), lessons=self._lessons_text(),
+                    stage_left=self.scheduler.stage_left() / 60, search_left=max(0.0, self.timer.left("search")) / 60,
+                    exp_time=self._est_time(parent.family))
+
+    def _research_usable(self) -> bool:
+        return bool(self.llm and self.llm.available and self.llm.budget_left("researcher") and self.research_fail < 3)
 
     def _start_research(self):
-        if self.research_future is not None or not self.llm or not self.llm.available or not self.llm.budget_left():
-            return
-        if self.research_skip > 0:  # Исследователь дважды подряд не дал нового — пропускаем пару раундов
-            self.research_skip -= 1
+        if self.research_future is not None or not self._research_usable():
             return
         parent = self._incumbent()
         ctx = self._research_context(parent)
-        schema = search_operators.schema_text(self.spec, self.hints)
-
-        timeout = max(MIN_START_S, self.timer.left("search")) if self.cfg.unlimited else None
+        stage = self.stage
+        schema = search_operators.schema_text(self.spec, stage, self.hints)
+        timeout = max(60.0, min(self.scheduler.stage_left(), self.timer.left("search")) - 10)
 
         def call():
-            return llm_roles.researcher(self.llm, schema, 4, ctx, timeout=timeout)
+            return llm_researcher.run(self.llm, self.kernel, self.cfg, stage, schema, ctx, self.reg.full_report,
+                                      timeout=timeout, log_path=self.workdir / "researcher_log.jsonl")
 
+        self.research_stage = stage
         self.research_future = self.pool.submit(call)
 
     def _collect_research(self, wait: float = 0.0):
@@ -505,89 +658,157 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             log.warning("Исследователь не ответил: %s", str(e)[:300])
             self.research_future = None
+            self.research_fail += 1
             return
         if out is None:
             return
         self.research_future = None
-        hyps = out.get("hypotheses", []) if isinstance(out, dict) else list(out)
-        lessons = [" ".join(str(x).split())[:240] for x in (out.get("lessons") or [])] if isinstance(out, dict) else []
+        self.research_fail = 0
+        if out.get("stage") != self.stage:
+            log.info("ответ Исследователя для подэтапа %s пришёл после перехода — отброшен", out.get("stage"))
+            return
+        lessons = [" ".join(str(x).split())[:240] for x in out.get("lessons") or []]
         if lessons:
             self.lessons = lessons[:8]
             (self.workdir / "lessons.txt").write_text("\n".join(self.lessons), encoding="utf-8")
             log.info("[%s] уроки Исследователя: %s", self.timer.stamp(), " | ".join(self.lessons)[:600])
+        self.reg.mark_obsolete(out.get("obsolete") or [])
         added = 0
-        for h in hyps:
+        for h in out.get("hypotheses", []):
+            if h.get("stage") != self.stage:
+                log.info("гипотеза другого подэтапа (%s) отброшена: %s", h.get("stage"), h.get("rationale", "")[:120])
+                continue
             h["source"] = "researcher"
-            sig = self._sig(h)
-            if sig not in self.tried_sigs:
+            if self._sig(h) not in self.tried_sigs:
                 self.queue.append(h)
                 added += 1
-        log.info("[%s] новых гипотез от Исследователя: %d", self.timer.stamp(), added)
+        log.info("[%s] новых гипотез от Исследователя (%s, инструментов %d): %d", self.timer.stamp(), self.stage,
+                 out.get("tools", 0), added)
         self.research_empty = 0 if added else self.research_empty + 1
-        if self.research_empty >= 2:
-            self.research_empty, self.research_skip = 0, 3
 
-    def _library_left(self) -> bool:
-        return any(self._sig(h) not in self.tried_sigs for h in self.library_queue)
-
-    def _next_hypothesis(self):
-        """Следующая гипотеза: очередь (Исследователь, абляции), затем библиотека.
-
-        Ответ Исследователя не ждём, пока есть непроверенные гипотезы библиотеки: он подхватится,
-        как только придёт. Ждём, только если проверять больше нечего.
-        """
-        self._collect_research()
-        if len(self.queue) < 2:
-            self._start_research()
-        if not self.queue and self.research_future is not None and not self._library_left():
-            limited = min(self.cfg.llm_timeout_s * 1.5, self.timer.left("search") - 30)
-            self._collect_research(wait=max(1.0, self._budget("search", limited)))
+    def _pop_queue(self):
         while self.queue:
             h = self.queue.pop(0)
+            if h.get("stage", self.stage) != self.stage:
+                continue
             sig = self._sig(h)
             if sig in self.tried_sigs:
                 continue
             self.tried_sigs.add(sig)
             return h
-        while self.library_queue:
-            h = self.library_queue.pop(0)
-            sig = self._sig(h)
+        return None
+
+    def _next_hypothesis(self):
+        """Очередь подэтапа (Исследователь, повторы «почти прошедших»); библиотека — запасной путь.
+
+        Если Исследователь ничего нового не дал, его спрашивают ещё раз; после двух пустых ответов
+        подряд (или если LLM недоступна) берётся библиотека подэтапа; иначе подэтап заканчивается.
+        """
+        while True:
+            self._collect_research()
+            if len(self.queue) < 2 and self.research_empty < 2:
+                self._start_research()
+            h = self._pop_queue()
+            if h is not None:
+                return h
+            if self.research_future is None:
+                break
+            limited = min(self.scheduler.stage_left() - 20, self.timer.left("search") - 30)
+            if limited <= 1 and not self.cfg.unlimited:
+                break
+            self._collect_research(wait=max(1.0, self._budget("search", limited)))
+            h = self._pop_queue()
+            if h is not None:
+                return h
+            if self.research_future is not None:  # не дождались
+                break
+        for cand in [c for c in self.library_queue if c.get("stage") == self.stage]:
+            self.library_queue.remove(cand)
+            sig = self._sig(cand)
             if sig not in self.tried_sigs:
                 self.tried_sigs.add(sig)
-                return h
+                log.info("гипотеза из библиотеки подэтапа %s: %s", self.stage, cand.get("rationale"))
+                return dict(cand)
         return None
+
+    # ------------------------------------------------------------------ повторный вызов Аналитика
+    def _recall_context(self):
+        return dict(task=self.task_text, analyst_json=self.reg.json_text(), short=self._short_text(),
+                    registry=self.reg.text_open(), solution=self._solution_text(), dataset=self.dataset_text,
+                    journal=self.journal.summary(self.stage))
+
+    def _recall(self, blocking: bool, reason: str):
+        if self.kernel is None or not self.llm or not self.llm.available or not self.reg.available \
+                or not self.llm.budget_left("analyst_delta") or self.recall_future is not None:
+            return
+        ctx = self._recall_context()
+        deadline = min(time.time() + self.cfg.recall_minutes * 60, self.timer.deadline("search") - 60)
+        if deadline - time.time() < 60:
+            return
+        stage = self.stage
+
+        def call():
+            return llm_analyst.run_delta(self.llm, self.kernel, self.cfg, self.workdir, ctx, deadline, reason)
+
+        log.info("[%s] повторный вызов Аналитика (%s): %s", self.timer.stamp(), "ждём" if blocking else "в фоне", reason)
+        self.recall_future = self.recall_pool.submit(call)
+        self.recall_source = f"Аналитик ({stage}: {reason[:80]})"
+        if blocking:
+            self._collect_recall(wait=max(1.0, deadline - time.time() + 30))
+
+    def _collect_recall(self, wait: float = 0.0):
+        fut = self.recall_future
+        if fut is None:
+            return
+        try:
+            delta = fut.result(timeout=wait) if wait > 0 else (fut.result() if fut.done() else "pending")
+        except cf.TimeoutError:
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("повторный вызов Аналитика не удался: %s", str(e)[:300])
+            self.recall_future = None
+            return
+        if isinstance(delta, str) and delta == "pending":
+            return
+        self.recall_future = None
+        if not delta:
+            log.info("повторный вызов Аналитика: дельты нет")
+            return
+        n = self.reg.apply_delta(delta, self.recall_source)
+        log.info("[%s] дельта Аналитика применена: изменений %d (снято %d, добавлено гипотез %d)", self.timer.stamp(), n,
+                 len(delta.get("retire") or []), len((delta.get("add") or {}).get("hypotheses") or []))
 
     # ------------------------------------------------------------------ Improve / Restart
     def _evaluate_hypothesis(self, hyp):
-        """Любая гипотеза применяется к текущему решению: все принятые изменения остаются на месте."""
+        """Гипотеза применяется к текущему решению: все принятые изменения остаются на месте."""
         kind = hyp.get("kind", "config")
         parent = self._incumbent()
         branch = self._new_branch() if kind == "restart" else parent.branch
         desc = (hyp.get("rationale") or kind)[:200]
+        if kind == "fit_predict":
+            if self.stage != "model":
+                return
+            self._op_escape(hyp)
+            return
         patch, notes = search_operators.validate_patch(hyp.get("patch") or {}, parent.config, self.spec,
-                                                       known_custom=set(self.custom_feats), hints=self.hints,
-                                                       allow_params=hyp.get("source") != "researcher")
+                                                       known_custom=set(self.codes_desc), hints=self.hints,
+                                                       allow_params=hyp.get("source") not in ("researcher",),
+                                                       stage=self.stage if kind != "restart" else None)
         if notes:
             log.info("патч %s: %s", hyp.get("source"), "; ".join(notes)[:300])
-        if kind in ("feature_code", "model_code"):
-            slot = "features" if kind == "feature_code" else "model"
-            slot_id = self._slot_id("fe" if slot == "features" else "mc")
+        if kind in ("code", "custom_model"):
+            slot = "transform" if kind == "code" else "model"
+            if slot == "model" and self.stage != "model":
+                return
+            slot_id = self._slot_id("tf" if slot == "transform" else "mc")
             deadline = self._deadline("search", min(self.timer.deadline("search") - 30,
                                                     time.time() + max(300.0, 0.15 * self.timer.left("search"))))
             impl = self._implement(slot, slot_id, hyp, deadline)
             if not impl:
                 return
-            if slot == "features":
-                flags = self._leak_check(slot_id)
-                if flags:
-                    node = self._new_node(parent.config, parent, "improve", desc, branch, hyp)
-                    node.flags, node.status, node.reason = flags, "flagged", "признак похож на утечку"
-                    node.change = f"features.custom += {slot_id} ({(hyp.get('feature_spec') or desc)[:120]})"
-                    self._journal(node, "flagged", mode="none")
-                    self.scheduler.feedback(False)
-                    return
-                self.custom_feats[slot_id] = (hyp.get("feature_spec") or desc)[:200]
-                patch = dict(patch, **{"features.custom": "+" + slot_id})
+            if slot == "transform":
+                self.codes_desc[slot_id] = (hyp.get("spec") or desc)[:200]
+                patch = dict(patch, **{"features.chain": "+" + slot_id})
             else:
                 patch = dict(patch, **{"model.name": "custom", "model.custom_id": slot_id})
         if not patch:
@@ -607,7 +828,8 @@ class Orchestrator:
         if not self.llm or not self.llm.available:
             return None
         try:
-            res = self.engineer.implement(slot, slot_id, hyp, deadline)
+            res = self.engineer.implement(slot, slot_id, hyp, self._incumbent().config, self.columns_cur,
+                                          self.reg.analyst_notes(hyp.get("ref")), deadline, len(self.data.X_all))
         except llm_client.LLMError as e:
             log.warning("Инженер недоступен: %s", str(e)[:200])
             return None
@@ -615,39 +837,25 @@ class Orchestrator:
             parent = self._incumbent()
             node = self._new_node(parent.config, parent, "improve", (hyp.get("rationale") or "")[:200], None, hyp)
             node.status, node.reason = "failed", "Инженер: " + str(res.get("error"))[:300]
-            node.change = f"{slot}: {(hyp.get('feature_spec') or hyp.get('rationale') or '')[:120]}"
+            node.change = f"{slot}: {(hyp.get('spec') or hyp.get('rationale') or '')[:120]}"
             self._journal(node, "failed", mode="none", error=res.get("error"))
             self.scheduler.feedback(False)
             log.info("Инженер не реализовал %s: %s", slot_id, str(res.get("error"))[:200])
             return None
-        log.info("Инженер реализовал %s за %d шагов", slot_id, len(res.get("steps", [])))
+        log.info("Инженер реализовал %s с попытки %d", slot_id, res.get("attempts", 1))
         return res
-
-    def _leak_check(self, slot_id):
-        import pandas as pd
-
-        path = self.workdir / "feats" / f"{slot_id}.pkl"
-        if not path.exists():
-            return []
-        add = pd.read_pickle(path)
-        rows = self.splits.search_idx
-        ids = self.data.train_ids.iloc[rows].to_numpy() if self.data.train_ids is not None else None
-        return eval_acceptance.leak_check(add.iloc[: self.data.n_train].iloc[rows].reset_index(drop=True),
-                                          self.y_search, ids, self.spec.task_type, self.cfg.leak_corr)
 
     # ------------------------------------------------------------------ оценка узла
     def _screen_of(self, node):
         if node.id not in self.screen_cache:
-            res = exp_runner.run_experiment(node.id, node.config, self.ctx, "screen",
-                                            budget_s=self._budget("search", max(60.0, self._est_time(node.family))))
-            self.screen_cache[node.id] = res
+            self.screen_cache[node.id] = self._exp(node.id, node.config, "screen",
+                                                   self._budget("search", max(60.0, self._est_time(node.family))))
         return self.screen_cache[node.id]
 
     def _alt_of(self, node):
         if node.id not in self.alt_cache:
-            res = exp_runner.run_experiment(node.id, node.config, self.ctx, "alt",
-                                            budget_s=self._budget("search", max(60.0, self._est_time(node.family))))
-            self.alt_cache[node.id] = res
+            self.alt_cache[node.id] = self._exp(node.id, node.config, "alt",
+                                                self._budget("search", max(60.0, self._est_time(node.family))))
         return self.alt_cache[node.id]
 
     def _cmp(self, a, b):
@@ -655,7 +863,6 @@ class Orchestrator:
                                               self.cfg.noise_se_mult)
 
     def _record_truncated(self, node, parent, mode, res, ref_scores):
-        """Обрезанный по дедлайну прогон: сводка в журнал и лог, в решениях не участвует."""
         done = res.get("folds_done") or []
         ref = [ref_scores[k] for k in done if k < len(ref_scores)] if ref_scores else []
         cmp = self._cmp(res["fold_scores"], ref) if ref and len(ref) == len(res["fold_scores"]) else None
@@ -663,9 +870,8 @@ class Orchestrator:
         node.reason = f"обучение остановлено по дедлайну: {res.get('stop_reason')}"
         extra = {"wins": cmp["wins"], "se": cmp["se"], "joined": False} if cmp else None
         self._journal(node, "truncated", mode=mode, delta=cmp["mean_gain"] if cmp else None, extra=extra)
-        log.info("[%s] %s %s [%s, %s]: ОБРЕЗАН по времени — CV %.6g на фолдах %s%s; в решениях не участвует",
-                 self.timer.stamp(), node.id, node.op, node.family, mode, res["mean"], [k + 1 for k in done],
-                 f" (Δ=%+.4g ± %.2g, {cmp['wins']}/{cmp['k']} фолдов)" % (cmp["mean_gain"], cmp["se"]) if cmp else "")
+        log.info("[%s] %s %s [%s, %s]: ОБРЕЗАН по времени — CV %.6g; в решениях не участвует", self.timer.stamp(),
+                 node.id, node.op, node.family, mode, res["mean"])
         self.scheduler.feedback(False, counts_for_plateau=False)
 
     def _evaluate(self, config, parent, op, desc, branch, hyp=None):
@@ -686,13 +892,13 @@ class Orchestrator:
         elif op == "tune":
             node.change = f"{desc}: гиперпараметры {fam}"
         else:
-            node.change = search_operators.describe_change(parent.config, config, self.custom_feats)
-        # скрининг: дешёвая оценка на 3 фолдах, в полную оценку проходят не явно худшие
+            node.change = search_operators.describe_change(parent.config, config, self.codes_desc)
+        # скрининг: дешёвая оценка на первых фолдах, в полную оценку проходят не явно худшие
         screen_room = self.cfg.unlimited or self.timer.left("search") > 1.6 * est
         if est > self.cfg.screen_if_full_s and parent.fold_scores and screen_room:
             ps = self._screen_of(parent)
             sb = self._budget("search", min(max(60.0, est), self.timer.left("search") - est))
-            node.screen = exp_runner.run_experiment(node.id, config, self.ctx, "screen", budget_s=sb)
+            node.screen = self._exp(node.id, config, "screen", sb, cache_from=parent.config)
             if node.screen.get("ok") and node.screen.get("truncated"):
                 ref = ps.get("fold_scores") if ps.get("ok") and not ps.get("truncated") else None
                 self._record_truncated(node, parent, "screen", node.screen, ref)
@@ -710,7 +916,7 @@ class Orchestrator:
             return node
         left = self.timer.left("search")
         budget = self._budget("search", min(left - 5, max(3 * est, 120.0)))
-        node.result = exp_runner.run_experiment(node.id, config, self.ctx, "full", budget_s=budget)
+        node.result = self._exp(node.id, config, "full", budget, cache_from=parent.config)
         if node.result.get("ok") and node.result.get("truncated"):
             self._record_truncated(node, parent, "full", node.result, parent.fold_scores)
             return node
@@ -719,7 +925,7 @@ class Orchestrator:
             self._journal(node, "failed", mode="full")
             self.scheduler.feedback(False)
             log.info("[%s] %s %s: ошибка — %s", self.timer.stamp(), node.id, op,
-                     str(node.result.get("error")).splitlines()[0][:200])
+                     str(node.result.get("error")).splitlines()[0][:300] if node.result.get("error") else "")
             return node
         cmp = self._cmp(node.result["fold_scores"], parent.fold_scores)
         node.cmp = cmp
@@ -733,42 +939,39 @@ class Orchestrator:
             node.flags.append("fast_train")
             accepted = self._critic_ok(node, parent, rel, "обучение подозрительно быстрое")
         node.status = "accepted" if accepted else ("flagged" if node.reason else "rejected")
-        if node.status == "flagged":
-            pass
-        elif not accepted:
+        if not accepted and node.status != "flagged":
             node.flags = []
-        # принятый узел становится текущим решением; escape — отдельный пайплайн, только для бленда
         joined = bool(accepted and op != "escape")
         if joined:
             self.pop.accept(node)
         self._journal(node, node.status, mode="full", delta=cmp["mean_gain"],
                       extra={"wins": cmp["wins"], "se": cmp["se"], "joined": joined})
-        log.info("[%s] %s %s [%s] на %s: %s — CV %.6g (Δ=%+.4g ± %.2g, %d/%d фолдов) — %s%s", self.timer.stamp(),
-                 node.id, op, fam, parent.id, node.change[:200], node.mean, cmp["mean_gain"], cmp["se"], cmp["wins"],
-                 cmp["k"], node.status, " → текущее решение" if joined else "")
+        log.info("[%s] %s %s [%s/%s] на %s: %s — CV %.6g (Δ=%+.4g ± %.2g, %d/%d фолдов) — %s%s", self.timer.stamp(),
+                 node.id, op, self.stage, fam, parent.id, node.change[:200], node.mean, cmp["mean_gain"], cmp["se"],
+                 cmp["wins"], cmp["k"], node.status, " → текущее решение" if joined else "")
         if accepted:
             node.flags = [f for f in node.flags if not f.startswith("jump") and f != "fast_train"]
             self._maybe_write(node)
         if joined:
+            self.research_empty = 0  # новое текущее решение — Исследователя снова есть о чём спросить
+            self._refresh_current(node)
             self._requeue_near_misses(node)
         self.scheduler.feedback(accepted)
         return node
 
     def _requeue_near_misses(self, new_best):
-        """После принятия: повторить на новом решении «почти прошедшие» гипотезы (выигрыш > 0, но ниже порога).
-
-        Признаки Инженера не пишутся заново: в патче уже id готовых признаков.
-        """
+        """После принятия: повторить на новом решении «почти прошедшие» гипотезы этого подэтапа."""
         left = self.cfg.near_miss_total - self.near_miss_used
         if left <= 0:
             return
         cands = []
         for n in self.pop.nodes.values():
             c = n.cmp or {}
-            if n.status != "rejected" or n.id in self.retried or n.op in ("tune", "escape") or not c:
+            if n.status != "rejected" or n.id in self.retried or n.op in ("tune", "escape") or not c \
+                    or n.stage != self.stage:
                 continue
             patch = (n.hypothesis or {}).get("patch") or {}
-            if not patch or "merge" in patch:
+            if not patch:
                 continue
             gain, se = c.get("mean_gain", 0.0), c.get("se", 0.0)
             if gain > 0 and gain >= 0.5 * se and 2 * c.get("wins", 0) >= c.get("k", 1):
@@ -778,7 +981,8 @@ class Orchestrator:
             self.retried.add(n.id)
             self.near_miss_used += 1
             hyp = n.hypothesis or {}
-            self.queue.insert(0, {"kind": "config", "block": hyp.get("block", "features"), "patch": dict(hyp["patch"]),
+            self.queue.insert(0, {"kind": "config", "stage": self.stage, "ref": hyp.get("ref"),
+                                  "block": hyp.get("block", "features"), "patch": dict(hyp["patch"]),
                                   "rationale": f"повтор на новом решении {new_best.id}: {n.change[:120]} "
                                                f"(на {n.parent} было Δ={n.cmp['mean_gain']:+.4g}, "
                                                f"{n.cmp['wins']}/{n.cmp['k']} фолдов)",
@@ -786,11 +990,14 @@ class Orchestrator:
             log.info("почти прошедшая гипотеза %s поставлена в очередь на %s", n.id, new_best.id)
 
     def _recheck_jump(self, node, parent, rel) -> bool:
+        if self.splits.fold_array("alt") is None:
+            node.flags.append("no_alt_folds")
+            return self._critic_ok(node, parent, rel, "альтернативного разбиения нет — перепроверка невозможна")
         if not self._can_start("search", self._est_time(node.family)):
             node.reason = "не хватило времени перепроверить скачок"
             return False
-        node.alt = exp_runner.run_experiment(node.id, node.config, self.ctx, "alt",
-                                             budget_s=self._budget("search", max(60.0, self._est_time(node.family))))
+        node.alt = self._exp(node.id, node.config, "alt", self._budget("search", max(60.0, self._est_time(node.family))),
+                             cache_from=parent.config)
         pa = self._alt_of(parent)
         if node.alt.get("truncated") or pa.get("truncated"):
             node.reason = "перепроверка скачка обрезана по времени — без неё скачок не принимается"
@@ -805,15 +1012,12 @@ class Orchestrator:
         return self._critic_ok(node, parent, rel, f"скачок повторился на других фолдах: Δ={c['mean_gain']:+.4g}")
 
     def _critic_ok(self, node, parent, rel, alt_text) -> bool:
-        if not self.llm or not self.llm.available or not self.llm.budget_left():
+        if not self.llm or not self.llm.available or not self.cfg.critic_enabled:
             return True
         code = json.dumps((node.hypothesis or {}).get("patch"), ensure_ascii=False)
-        for key in ("custom_id",):
-            cid = node.config.get("model", {}).get(key)
-            if cid:
-                p = self.workdir / "codes" / f"{cid}.py"
-                code += "\n" + (p.read_text(encoding="utf-8")[:4000] if p.exists() else "")
-        for fid in node.config.get("features", {}).get("custom", []):
+        cid = node.config.get("model", {}).get("custom_id")
+        ids = ([cid] if cid else []) + list(node.config.get("features", {}).get("chain", []))
+        for fid in ids:
             p = self.workdir / "codes" / f"{fid}.py"
             if p.exists():
                 code += f"\n# {fid}\n" + p.read_text(encoding="utf-8")[:3000]
@@ -829,7 +1033,6 @@ class Orchestrator:
         except Exception as e:  # noqa: BLE001
             log.warning("Критик не ответил: %s", str(e)[:200])
             return True
-        node.critic = v
         if v["verdict"] == "reject":
             node.reason = "Критик: " + v.get("reason", "")[:300]
             return False
@@ -837,35 +1040,38 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ Restart / Tune / Escape
     def _op_restart(self, desc, patch):
-        """Другое семейство моделей (или кодирование) на текущем решении: признаки остаются."""
+        """Другое семейство моделей на текущем решении (подэтап Model): данные решения остаются."""
         self.restart_done.add(self._restart_key(patch))
-        self._evaluate_hypothesis({"kind": "restart", "block": "model", "patch": patch, "rationale": desc,
-                                   "source": "scheduler"})
+        self._evaluate_hypothesis({"kind": "restart", "stage": self.stage, "block": "model", "patch": patch,
+                                   "rationale": desc, "source": "scheduler"})
 
     def _op_tune(self, node):
-        budget = self._budget("search", min(900.0, 0.2 * self.timer.left("search")))
-        if not self.cfg.unlimited and budget < 6 * 0.45 * self._est_time(node.family):  # меньше ~6 проб — не стоит
+        budget = self._budget("search", min(900.0, 0.5 * self.scheduler.stage_left()))
+        if not self.cfg.unlimited and budget < 6 * 0.45 * self._est_time(node.family):
             return
         if not self._can_start("search", 0.0):
             return
-        res = exp_runner.run_job({"kind": "tune", "config": node.config, "n_trials": self.cfg.tune_trials},
-                                 self.ctx, budget, f"{node.id}_tune")
+        upto = self._chain_len(node.config)
+        job = {"kind": "tune", "config": node.config, "n_trials": self.cfg.tune_trials, "cache_upto": upto,
+               "cache_max_gb": self.cfg.cache_max_gb}
+        res = exp_runner.run_job(job, self.ctx, budget, f"{node.id}_tune")
         if not res.get("ok"):
             log.info("Tune %s не удался: %s", node.id, str(res.get("error"))[:200])
             return
         cfg = search_operators.apply_patch(node.config, {"model.params": res["best_params"]})
         log.info("Tune %s: %d проб Optuna", node.id, res["n_trials"])
         self._evaluate(cfg, node, "tune", f"Optuna ({res['n_trials']} проб) для {node.id}", node.branch,
-                       {"kind": "tune", "patch": {"model.params": res["best_params"]}})
+                       {"kind": "tune", "stage": self.stage, "patch": {"model.params": res["best_params"]}})
 
-    def _op_escape(self):
+    def _op_escape(self, hyp=None):
         if not self.llm or not self.llm.available:
             return
-        reason = self.spec.out_of_library_reason or "поиск вышел на плато"
-        hyp = {"kind": "escape", "rationale": f"аварийный оператор: полный пайплайн ({reason})",
-               "feature_spec": ("Напиши сильный пайплайн целиком: подготовка признаков (включая текст и даты, если есть), "
-                                "модель и предсказания. Учитывай метрику " + self.spec.metric + "."),
-               "expected": "работоспособное решение для нестандартной задачи"}
+        reason = self.spec.out_of_library_reason or "предложено Исследователем"
+        hyp = dict(hyp or {"kind": "fit_predict", "rationale": f"аварийный оператор: полный пайплайн ({reason})",
+                           "spec": ("Напиши сильный пайплайн целиком: подготовка признаков (включая текст и даты, если "
+                                    "есть), модель и предсказания. Учитывай метрику " + self.spec.metric + "."),
+                           "expected": "работоспособное решение для нестандартной задачи"})
+        hyp.setdefault("stage", self.stage)
         slot_id = self._slot_id("es")
         deadline = self._deadline("search", min(self.timer.deadline("search") - 60,
                                                 time.time() + max(600.0, 0.2 * self.timer.left("search"))))
@@ -875,9 +1081,10 @@ class Orchestrator:
         cfg = search_operators.apply_patch(self.l1.config, {"model.name": "escape"})
         cfg["model"]["escape_id"] = slot_id
         # сравнивается с текущим решением, но цепочку не продолжает: это отдельный пайплайн для бленда
-        self._evaluate(cfg, self._incumbent(), "escape", hyp["rationale"], self._new_branch(), hyp)
+        self._evaluate(cfg, self._incumbent(), "escape", hyp.get("rationale", "fit_predict")[:200], self._new_branch(),
+                       hyp)
 
-    # ================================================================== финалисты
+    # ================================================================== этап 4: финалисты
     def _final_pool(self):
         ok = [n for n in self.pop.nodes.values() if n.mean is not None and n.status in ("accepted", "anchor", "rejected")
               and not n.flags and n.result.get("preds_path")]
@@ -891,6 +1098,7 @@ class Orchestrator:
         return pool
 
     def _reseed(self):
+        self.stage = None
         pool = self._final_pool()
         finalists = pool[: self.cfg.finalists]
         if self.l1 not in finalists:
@@ -902,19 +1110,17 @@ class Orchestrator:
             if not self._can_start("reseed", est * 0.9):
                 continue
             seeds = list(range(1, self.cfg.reseed_seeds + 1))
-            res = exp_runner.run_experiment(n.id, n.config, self.ctx, "full", seeds=seeds,
-                                            budget_s=self._budget("reseed", min(self.timer.left("reseed"), est * 2)))
+            res = self._exp(n.id, n.config, "full", self._budget("reseed", min(self.timer.left("reseed"), est * 2)),
+                            seeds=seeds)
             if res.get("ok") and res.get("truncated"):
-                log.info("[%s] сиды %s обрезаны по времени (%s): полных сидов %d из %d — проверка стабильности "
-                         "не засчитана", self.timer.stamp(), n.id, res.get("stop_reason"),
-                         len(res.get("seed_means", [])), len(seeds))
+                log.info("[%s] сиды %s обрезаны по времени — проверка стабильности не засчитана", self.timer.stamp(), n.id)
             elif res.get("ok"):
                 n.reseed = res
                 means = [n.mean] + list(res.get("seed_means", []))
                 log.info("[%s] сиды %s: %s", self.timer.stamp(), n.id, [round(m, 6) for m in means])
             else:
                 log.info("[%s] сиды %s не удались: %s", self.timer.stamp(), n.id,
-                         str(res.get("error")).splitlines()[0][:200])
+                         str(res.get("error")).splitlines()[0][:200] if res.get("error") else "")
         self.finalists = finalists
 
     def _combined(self, node):
@@ -923,13 +1129,9 @@ class Orchestrator:
         if node.reseed and node.reseed.get("ok"):
             z = np.load(node.reseed["preds_path"])
             S = len(node.reseed.get("seed_means", [1]))
-            out = {}
-            for k in ("oof", "ho", "te"):
-                out[k] = (base[k] + S * z[k]) / (1 + S)
-            return out
+            return {k: (base[k] + S * z[k]) / (1 + S) for k in ("oof", "ho", "te")}
         return base
 
-    # ================================================================== финал
     def _final(self):
         if self.l1 is None:
             log.warning("L1 нет — на диске константный сабмит")
@@ -941,7 +1143,6 @@ class Orchestrator:
         if self.l1 not in cands:
             cands.append(self.l1)
         cands.sort(key=lambda n: -task_metrics.gain(n.mean, self.gib))
-        # нестабильные по сидам узлы (кроме L1) не участвуют в бленде
         spreads = {n.id: float(np.std([n.mean] + n.reseed.get("seed_means", []))) for n in cands
                    if n.reseed and n.reseed.get("ok")}
         if len(spreads) >= 3:
@@ -951,6 +1152,7 @@ class Orchestrator:
         cands = [n for n in cands if n.id not in excluded or n is self.l1]
         preds = {n.id: self._combined(n) for n in cands}
         ys = self.y_search
+        # строки, оценённые всеми кандидатами (в screen-режиме OOF не используется — тут только full)
         oofs = [preds[n.id]["oof"] for n in cands]
         weights = final_ensemble.caruana(oofs, ys, self.spec, self.metric, self.cfg.blend_max_steps) \
             if len(cands) > 1 else np.array([1.0])
@@ -969,14 +1171,13 @@ class Orchestrator:
         used = [i for i, w in enumerate(weights) if w > 0]
         if len(used) >= 2:
             b_oof = final_ensemble.blend(oofs, weights)
+            b_post = final_ensemble.fit_post(b_oof, ys, self.spec, post_cfg, self.metric)
             options.append({"name": "бленд " + "+".join(f"{cands[i].id}:{weights[i]:.2f}" for i in used),
                             "complexity": 2, "nodes": [cands[i] for i in used], "w": [weights[i] for i in used],
                             "ho": final_ensemble.blend([preds[n.id]["ho"] for n in cands], weights),
                             "te": final_ensemble.blend([preds[n.id]["te"] for n in cands], weights),
-                            "post": final_ensemble.fit_post(b_oof, ys, self.spec, post_cfg, self.metric),
-                            "oof_score": task_metrics.score(self.metric, ys, b_oof, self.spec.task_type,
-                                                            final_ensemble.fit_post(b_oof, ys, self.spec, post_cfg,
-                                                                                    self.metric))})
+                            "post": b_post,
+                            "oof_score": task_metrics.score(self.metric, ys, b_oof, self.spec.task_type, b_post)})
         winner, report = final_ensemble.select_final(options, self.vault, self.spec, self.metric, self.cfg)
         log.info("[%s] выбор на selection-holdout: %s → %s", self.timer.stamp(),
                  json.dumps(report, ensure_ascii=False), winner["name"])
@@ -989,11 +1190,11 @@ class Orchestrator:
         self.writer.write(winner["te"], post, f"финал: {winner['name']}")
         self.summary.update(choice=winner["name"], holdout=report, prior_shift=shift,
                             l1_cv=self.l1.mean, best_cv=self._incumbent().mean,
-                            accepted_chain=[f"{n.id}: {n.change}" for n in self.pop.lineage()])
+                            accepted_chain=[f"{n.id} [{n.stage}]: {n.change}" for n in self.pop.lineage()])
         self._refit(winner, post)
 
     def _critic_final(self, cands) -> set:
-        if not self.llm or not self.llm.available or not self.llm.budget_left() or len(cands) < 2:
+        if not self.llm or not self.llm.available or not self.cfg.critic_enabled or len(cands) < 2:
             return set()
         lines = []
         for n in cands:
@@ -1046,7 +1247,9 @@ class Orchestrator:
         try:
             self.summary["submission"] = (self.writer.current if self.writer else None)
             self.summary["llm"] = self.llm.usage_summary() if self.llm else None
-            self.summary["journal"] = self.journal.stats() if hasattr(self, "journal") else None
+            self.summary["journal"] = self.journal.stats() if self.journal is not None else None
+            self.summary["split_source"] = self.split_source
+            self.summary["registry"] = {k: v["status"] for k, v in self.reg.items.items()}
             self.summary["elapsed_s"] = round(self.timer.elapsed(), 1)
             (self.workdir / "final.json").write_text(json.dumps(self.summary, ensure_ascii=False, indent=1,
                                                                 default=str), encoding="utf-8")

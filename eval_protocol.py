@@ -1,14 +1,19 @@
 """Протокол оценки: поисковые фолды, selection-holdout и сейф меток.
 
 Разбиение делается один раз за прогон и не меняется. Все кандидаты сравниваются на
-одних и тех же фолдах. Метки selection-holdout хранятся только в LabelVault в процессе
-оркестратора: дочерние процессы и LLM их не получают. Читает их один модуль —
-final_ensemble.select_final — один раз, в конце.
+одних и тех же фолдах. Основной путь — разбиение Аналитика: holdout он задаёт кодом,
+фолды харнесс строит по типу и колонкам (random / stratified / group / ordered) или берёт
+готовые (custom); всё приходит через submit_split в Python-сессии (exp_kernel) и
+проверяется здесь (check_split). Запасной путь — схема профайлера (make_splits).
+Метки selection-holdout хранятся только в LabelVault в процессе оркестратора: дочерние
+процессы их не получают. Читает их один модуль — final_ensemble.select_final — в конце.
 """
 
 import itertools
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -30,28 +35,44 @@ class Splits:
     folds_alt: np.ndarray
     holdout_weights: np.ndarray | None = None
     note: str = ""
+    screen_k: int = 0  # >0: быстрый режим оценивает только первые screen_k фолдов основного разбиения
 
     @property
     def n_folds(self) -> int:
         return int(self.folds.max()) + 1
 
-    def fold_array(self, kind: str) -> np.ndarray:
-        return {"full": self.folds, "screen": self.folds_screen, "alt": self.folds_alt}[kind]
+    def fold_array(self, kind: str):
+        """Массив фолдов для режима; для alt — None, если альтернативного разбиения нет."""
+        arr = {"full": self.folds, "screen": self.folds_screen, "alt": self.folds_alt}[kind]
+        return arr if arr is not None and len(arr) else None
+
+    def eval_folds(self, kind: str) -> list:
+        """Какие фолды режим оценивает (обучение — на всех остальных строках поиска)."""
+        arr = self.fold_array(kind)
+        if arr is None:
+            return []
+        K = int(arr.max()) + 1
+        if kind == "screen" and self.screen_k:
+            return list(range(min(self.screen_k, K)))
+        return list(range(K))
 
     def save(self, path):
+        alt = self.folds_alt if self.folds_alt is not None else np.array([], dtype=int)
         np.savez(path, search_idx=self.search_idx, holdout_idx=self.holdout_idx, folds=self.folds,
-                 folds_screen=self.folds_screen, folds_alt=self.folds_alt,
+                 folds_screen=self.folds_screen, folds_alt=alt,
                  holdout_weights=self.holdout_weights if self.holdout_weights is not None else np.array([]),
-                 meta=np.array([self.scheme, self.group_col or "", self.note], dtype=object))
+                 meta=np.array([self.scheme, self.group_col or "", self.note, str(self.screen_k)], dtype=object))
 
     @classmethod
     def load(cls, path) -> "Splits":
         z = np.load(path, allow_pickle=True)
         meta = z["meta"]
         hw = z["holdout_weights"]
+        alt = z["folds_alt"]
         return cls(scheme=str(meta[0]), group_col=str(meta[1]) or None, search_idx=z["search_idx"],
                    holdout_idx=z["holdout_idx"], folds=z["folds"], folds_screen=z["folds_screen"],
-                   folds_alt=z["folds_alt"], holdout_weights=hw if hw.size else None, note=str(meta[2]))
+                   folds_alt=alt if alt.size else None, holdout_weights=hw if hw.size else None,
+                   note=str(meta[2]), screen_k=int(meta[3]) if len(meta) > 3 else 0)
 
     def describe(self) -> str:
         sizes = np.bincount(self.folds)
@@ -224,6 +245,208 @@ def make_splits(spec, data, prof: dict, cfg) -> tuple:
 
     vault = LabelVault(y[holdout_idx], splits.holdout_weights)
     return splits, vault
+
+
+# ---------------------------------------------------------------- разбиение Аналитика
+
+SPLIT_TYPES = ("random", "stratified", "group", "ordered", "custom")
+SPLIT_FILE = "analyst_split.npz"
+
+
+def group_codes(frame: pd.DataFrame, columns: list) -> np.ndarray:
+    """Коды групп по одной или нескольким колонкам (составной ключ); пропуск — отдельное значение."""
+    key = None
+    for c in columns:
+        s = frame[c].astype(object).where(frame[c].notna(), "__nan__").astype(str)
+        key = s if key is None else key + "\x1f" + s
+    return pd.factorize(key)[0]
+
+
+def _order_values(s: pd.Series) -> np.ndarray:
+    """Значения колонки порядка как числа: число, дата или категория по возрастанию."""
+    v = pd.to_numeric(s, errors="coerce")
+    if v.notna().mean() >= 0.9:
+        return v.to_numpy(dtype=float)
+    d = pd.to_datetime(s, errors="coerce", format="mixed")
+    if d.notna().mean() >= 0.9:
+        return (d - pd.Timestamp("1970-01-01")).dt.total_seconds().to_numpy(dtype=float)
+    cats = sorted(s.dropna().astype(str).unique())
+    pos = {c: i for i, c in enumerate(cats)}
+    return s.astype(str).map(pos).astype(float).to_numpy()
+
+
+def build_folds(kind: str, frame: pd.DataFrame, y, task_type: str, columns, k: int, seed: int) -> np.ndarray:
+    """Фолды по типу схемы для строк frame (поисковая часть): массив номеров 0..K-1."""
+    n = len(frame)
+    columns = [c for c in (columns or []) if c in frame.columns]
+    if kind == "random":
+        from sklearn.model_selection import KFold
+        f = np.zeros(n, int)
+        for i, (_, va) in enumerate(KFold(n_splits=k, shuffle=True, random_state=seed).split(np.zeros(n))):
+            f[va] = i
+        return f
+    if kind == "group":
+        if not columns:
+            raise ValueError("для type='group' нужны columns — колонки ключа группы")
+        g = group_codes(frame, columns)
+        ng = len(np.unique(g))
+        if ng < 2:
+            raise ValueError("все строки попали в одну группу")
+        kk = max(2, min(k, ng))
+        perm = np.random.default_rng(seed).permutation(ng)
+        sizes = np.bincount(g, minlength=ng)
+        # жадно раскладываем группы по фолдам от крупных к мелким, при равенстве — случайный порядок
+        order = sorted(range(ng), key=lambda j: (-sizes[j], perm[j]))
+        load = np.zeros(kk)
+        assign = np.zeros(ng, int)
+        for j in order:
+            t = int(np.argmin(load))
+            assign[j] = t
+            load[t] += sizes[j]
+        return assign[g]
+    if kind == "ordered":
+        if not columns:
+            raise ValueError("для type='ordered' нужна колонка порядка в columns")
+        v = _order_values(frame[columns[0]])
+        if np.isnan(v).any():
+            raise ValueError(f"в колонке порядка {columns[0]} есть пропуски или нечисловые значения")
+        uniq = np.unique(v)
+        if len(uniq) < 2:
+            raise ValueError(f"в колонке порядка {columns[0]} меньше двух значений")
+        blocks = np.array_split(uniq, min(k, len(uniq)))  # фолд = период или подряд идущие периоды
+        f = np.zeros(n, int)
+        for i, b in enumerate(blocks):
+            f[np.isin(v, b)] = i
+        return f
+    # stratified — по умолчанию
+    strata = _strata(np.asarray(y), task_type)
+    f = np.zeros(n, int)
+    try:
+        for i, (_, va) in enumerate(StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+                                    .split(np.zeros(n), strata)):
+            f[va] = i
+    except ValueError:
+        return build_folds("random", frame, y, task_type, columns, k, seed)
+    return f
+
+
+def resolve_rows(sel, train: pd.DataFrame, id_col) -> np.ndarray:
+    """Выбор строк train → булева маска: маска той же длины, иначе id (если есть) или номера строк."""
+    n = len(train)
+    if isinstance(sel, (pd.Series, pd.Index)):
+        sel = sel.to_numpy()
+    arr = np.asarray(sel)
+    if arr.dtype == bool:
+        if arr.shape[0] != n:
+            raise ValueError(f"маска holdout длины {arr.shape[0]}, а строк в train {n}")
+        return arr.astype(bool)
+    vals = arr.ravel()
+    if id_col and id_col in train.columns:
+        ids = train[id_col]
+        mask = ids.astype(str).isin(set(map(str, vals))).to_numpy()
+        if mask.sum() == 0:
+            raise ValueError(f"ни одно значение не совпало с колонкой id {id_col}")
+        return mask
+    pos = vals.astype(int)
+    if pos.min() < 0 or pos.max() >= n:
+        raise ValueError("номера строк вне train")
+    mask = np.zeros(n, bool)
+    mask[pos] = True
+    return mask
+
+
+def check_split(holdout: np.ndarray, folds: np.ndarray, valid: np.ndarray, y_valid, task_type: str,
+                n_classes: int, min_frac: float, max_frac: float) -> tuple:
+    """Проверить разбиение по строкам сырого train. Возвращает (ошибки, сводка).
+
+    holdout — булева маска; folds — номер фолда (≥0 для строк поиска); valid — строки с таргетом;
+    y_valid — таргет строк valid (классы — любые метки, регрессия — числа).
+    """
+    errors = []
+    n_valid = int(valid.sum())
+    ho = holdout & valid
+    search = valid & ~holdout
+    frac = ho.sum() / max(1, n_valid)
+    if ho.sum() == 0:
+        errors.append("holdout пустой")
+    elif not (min_frac <= frac <= max_frac):
+        errors.append(f"доля holdout {frac:.1%} вне допустимых {min_frac:.0%}–{max_frac:.0%} строк с таргетом")
+    f = folds[search]
+    if (f < 0).any():
+        errors.append(f"{int((f < 0).sum())} строк поиска без фолда")
+    uniq = np.unique(f[f >= 0])
+    if len(uniq) < 2:
+        errors.append("нужно хотя бы 2 фолда")
+    sizes = {int(u): int((f == u).sum()) for u in uniq}
+    min_size = max(20, int(0.02 * search.sum()))
+    small = [u for u, c in sizes.items() if c < min_size]
+    if small:
+        errors.append(f"фолды-крошки (меньше {min_size} строк): {small}")
+    yv = pd.Series(np.asarray(y_valid))
+    y_full = pd.Series([None] * len(valid), dtype=object)
+    y_full[np.where(valid)[0]] = yv.to_numpy()
+    lines = [f"строк с таргетом {n_valid}; holdout {int(ho.sum())} ({frac:.1%}); поиск {int(search.sum())}, "
+             f"фолдов {len(uniq)}: " + ", ".join(f"{u}={c}" for u, c in sizes.items())]
+    if task_type in ("binary", "multiclass"):
+        ys = y_full[search].astype(str).to_numpy()
+        classes = sorted(set(y_full[valid].astype(str)))
+        missing_search = [c for c in classes if (ys == c).sum() == 0]
+        if missing_search:
+            errors.append(f"классы {missing_search[:10]} есть только в holdout — в поиске их нет")
+        for u in uniq:
+            tr_cls = set(ys[f != u])
+            lost = [c for c in classes if c not in tr_cls and c not in missing_search]
+            if lost:
+                errors.append(f"в обучающей части фолда {u} нет классов {lost[:10]}")
+        yh = y_full[ho].astype(str)
+        lines.append("доли классов: поиск " + ", ".join(f"{c}={(ys == c).mean():.3f}" for c in classes[:12])
+                     + "; holdout " + ", ".join(f"{c}={(yh == c).mean():.3f}" for c in classes[:12]))
+    elif task_type == "regression":
+        yn = pd.to_numeric(y_full, errors="coerce")
+        parts = [f"holdout {yn[ho].mean():.4g}"] + [f"фолд {u} {yn[np.where(search)[0][f == u]].mean():.4g}"
+                                                    for u in uniq]
+        lines.append("среднее таргета: " + ", ".join(parts))
+    return errors, "\n".join(lines)
+
+
+def save_analyst_split(workdir, holdout, folds, folds_alt, meta: dict):
+    np.savez(Path(workdir) / SPLIT_FILE, holdout=holdout.astype(bool), folds=folds.astype(int),
+             folds_alt=folds_alt.astype(int) if folds_alt is not None else np.array([], dtype=int),
+             meta=np.array([json.dumps(meta, ensure_ascii=False)], dtype=object))
+
+
+def splits_from_analyst(spec, data, raw_valid: np.ndarray, workdir, cfg) -> tuple | None:
+    """Разбиение Аналитика (файл submit_split) → (Splits, LabelVault) или None, если файла нет или он плох."""
+    path = Path(workdir) / SPLIT_FILE
+    if not path.exists():
+        return None
+    z = np.load(path, allow_pickle=True)
+    meta = json.loads(str(z["meta"][0]))
+    holdout, folds_raw = z["holdout"], z["folds"]
+    alt_raw = z["folds_alt"] if z["folds_alt"].size else None
+    if len(holdout) != len(raw_valid) or len(folds_raw) != len(raw_valid):
+        log.warning("разбиение Аналитика: длина массивов не совпадает с train — не используется")
+        return None
+    pos = np.where(raw_valid)[0]  # позиции строк данных в сыром train
+    ho_data = holdout[pos]
+    holdout_idx = np.where(ho_data)[0]
+    search_idx = np.where(~ho_data)[0]
+    f = folds_raw[pos][search_idx]
+    if len(search_idx) == 0 or (f < 0).any():
+        log.warning("разбиение Аналитика: у строк поиска нет фолдов — не используется")
+        return None
+    _, folds = np.unique(f, return_inverse=True)
+    folds_alt = None
+    if alt_raw is not None:
+        a = alt_raw[pos][search_idx]
+        if (a >= 0).all() and len(np.unique(a)) >= 2:
+            folds_alt = np.unique(a, return_inverse=True)[1]
+    kind = meta.get("type", "custom")
+    cols = meta.get("columns") or []
+    splits = Splits(scheme=f"analyst:{kind}", group_col=",".join(cols) or None, search_idx=search_idx,
+                    holdout_idx=holdout_idx, folds=folds, folds_screen=folds.copy(), folds_alt=folds_alt,
+                    note="разбиение Аналитика (submit_split)", screen_k=cfg.screen_folds)
+    return splits, LabelVault(data.y[holdout_idx])
 
 
 class LabelVault:

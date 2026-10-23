@@ -31,7 +31,13 @@ class Node:
     change: str = ""  # что изменено относительно родителя, человекочитаемо
     cmp: dict | None = None  # парное сравнение с родителем по фолдам (mean_gain, se, wins, k)
     reseed: dict | None = None
+    stage: str = ""  # подэтап поиска, в котором проверялась гипотеза (preprocessing / features / model)
     created: float = field(default_factory=time.time)
+
+    @property
+    def ref(self):
+        """id гипотезы Аналитика (H.., R.., T..), которую проверяет этот узел, или None."""
+        return (self.hypothesis or {}).get("ref")
 
     @property
     def mean(self):

@@ -6,7 +6,13 @@
 обучает модели по фолдам и сохраняет OOF, предсказания для holdout и test и скоры по фолдам.
 Метрику считает только этот код; LLM получает лишь итоговые числа.
 
-Виды заданий: experiment (режимы full / screen / alt), tune, refit, adversarial.
+Виды заданий: experiment (режимы full / screen / alt), tune, refit, adversarial, materialize.
+
+Данные фолда: базовые признаки (встроенные операции, features.drop) → цепочка transform Инженера
+(config.features.chain; вызывается внутри фолда, таргет — только обучающей части; результат принятой
+части цепочки кэшируется на диске по фолдам — job.cache_upto) → редкие категории, флаги пропусков,
+удаление сырых текстов и дат → кодирование категорий → модель. В режиме screen оцениваются только
+первые фолды основного разбиения (Splits.eval_folds).
 
 Если обучение остановлено по дедлайну (модель недообучена или не все фолды пройдены), результат
 помечается truncated=True: скоры по пройденным фолдам, среднее и время в нём есть, но
@@ -250,31 +256,92 @@ def _load(job):
 
 
 def build_features(config: dict, data: dict, spec, hints: dict, workdir: Path):
-    import pandas as pd
-
+    """Базовые признаки до цепочки transform: встроенные операции (без таргета) и features.drop."""
     import feat_builtin
 
     X = data["X_all"]
     ctx = {"cat_cols": spec.cat_cols, "num_cols": spec.num_cols, "text_cols": spec.text_cols,
-           "datetime_cols": spec.datetime_cols, "top_num": hints.get("top_num", []),
-           "segments": hints.get("segments", [])}
+           "datetime_cols": spec.datetime_cols, "top_num": hints.get("top_num", []), "segments": []}
     feats = config.get("features", {})
     ops = list(dict.fromkeys(feat_builtin.default_ops(spec) + list(feats.get("builtin", []))))
     X = feat_builtin.apply_ops(X, ops, ctx)
-    for fid in feats.get("custom", []):
-        path = Path(workdir) / "feats" / f"{fid}.pkl"
-        add = pd.read_pickle(path)
-        add.index = X.index
-        X = pd.concat([X, add.loc[:, [c for c in add.columns if c not in X.columns]]], axis=1)
     drop = [c for c in feats.get("drop", []) if c in X.columns]
     if drop:
         X = X.drop(columns=drop)
-    pre = config.get("preprocess", {})
-    X = feat_builtin.rare_merge(X, feat_builtin.category_columns(X), int(pre.get("rare_min_count", 0) or 0))
-    if pre.get("missing_flags"):
-        X = feat_builtin.missing_flags(X, [c for c in spec.num_cols if c in X.columns])
-    X = feat_builtin.drop_raw_objects(X)
     return X
+
+
+def finish_frames(frames: list, config: dict, spec) -> list:
+    """После цепочки: редкие категории, флаги пропусков, удаление сырых текстов и дат — по всем кадрам вместе."""
+    import pandas as pd
+
+    import feat_builtin
+
+    pre = config.get("preprocess", {})
+    lens = [len(f) for f in frames]
+    allX = pd.concat(frames, axis=0, ignore_index=True)
+    allX = feat_builtin.rare_merge(allX, feat_builtin.category_columns(allX), int(pre.get("rare_min_count", 0) or 0))
+    if pre.get("missing_flags"):
+        allX = feat_builtin.missing_flags(allX, [c for c in allX.columns if pd.api.types.is_numeric_dtype(allX[c])])
+    allX = feat_builtin.drop_raw_objects(allX)
+    out, start = [], 0
+    for n in lens:
+        out.append(allX.iloc[start: start + n].reset_index(drop=True))
+        start += n
+    return out
+
+
+def _cache_dir(workdir) -> Path:
+    d = Path(workdir) / "cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cache_trim(workdir, max_gb: float):
+    files = sorted(_cache_dir(workdir).glob("*.pkl"), key=lambda p: p.stat().st_mtime)
+    total = sum(p.stat().st_size for p in files)
+    while files and total > max_gb * 1024**3:
+        p = files.pop(0)
+        total -= p.stat().st_size
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def prepare_fold(config: dict, spec, workdir, Xtr, ytr, frames: list, cache: dict | None = None) -> tuple:
+    """Данные фолда для модели: цепочка transform (принятая часть — из кэша) и завершающая обработка."""
+    import feat_transform
+
+    chain = list(config.get("features", {}).get("chain", []) or [])
+    keep_raw = set(spec.text_cols) | set(spec.datetime_cols)
+    start = 0
+    upto = min(int((cache or {}).get("upto", 0) or 0), len(chain))
+    if cache and upto > 0:
+        feats = config.get("features", {})
+        key = feat_transform.cache_key([feats.get("builtin", []), feats.get("drop", []), chain[:upto],
+                                        cache.get("tag"), len(frames), len(Xtr)])
+        path = _cache_dir(workdir) / f"{key}.pkl"
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    Xtr, frames = pickle.load(f)
+                start = upto
+            except Exception:
+                start = 0
+        if start == 0:
+            Xtr, frames = feat_transform.run_chain(chain[:upto], workdir, Xtr, ytr, frames, keep_raw)
+            start = upto
+            size = sum(int(f.memory_usage(index=False).sum()) for f in [Xtr] + frames)
+            if size < 1.5 * 1024**3:
+                tmp = path.with_suffix(".tmp")
+                with open(tmp, "wb") as f:
+                    pickle.dump((Xtr, frames), f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp, path)
+                _cache_trim(workdir, float(cache.get("max_gb", 6.0)))
+    Xtr, frames = feat_transform.run_chain(chain[start:], workdir, Xtr, ytr, frames, keep_raw)
+    out = finish_frames([Xtr] + list(frames), config, spec)
+    return out[0], out[1:]
 
 
 def _safe_names(cols):
@@ -379,7 +446,7 @@ def _single_tasks(spec):
 
 
 def _fit_predict(config, spec, Xtr, ytr, Xva, yva, others, seed, n_jobs, fast, deadline, workdir, n_estimators=None):
-    """Обучить модель(и) на Xtr и предсказать для [Xva] + others.
+    """Обучить модель(и) на подготовленных Xtr и предсказать для [Xva] + others.
 
     Возвращает (список предсказаний, best_iter, важности, число признаков, обучение остановлено по дедлайну).
     """
@@ -473,6 +540,17 @@ def _progress(job, text: str):
         pass
 
 
+def _cache_spec(job, folds, k) -> dict | None:
+    """Кэш принятой части цепочки для фолда k: ключ — разбиение (хэш массива фолдов) и номер фолда."""
+    import hashlib
+
+    upto = int(job.get("cache_upto", 0) or 0)
+    if upto <= 0:
+        return None
+    tag = hashlib.md5(np.ascontiguousarray(folds).tobytes()).hexdigest()[:10] + f":{k}"
+    return {"upto": upto, "tag": tag, "max_gb": float(job.get("cache_max_gb", 6.0))}
+
+
 def _experiment(job):
     import final_ensemble
     import task_metrics
@@ -486,16 +564,19 @@ def _experiment(job):
     t0 = time.time()
     metric = task_metrics.metric_for(spec)
     model_name = config.get("model", {}).get("name", "lgbm")
+    kind = mode if mode in ("full", "screen", "alt") else "full"
+    folds = splits.fold_array(kind)
+    if folds is None:
+        return {"ok": False, "error": f"для режима {mode} нет разбиения (альтернативных фолдов нет)"}
+    ks = splits.eval_folds(kind)
+    K = len(ks)
     X = build_features(config, data, spec, hints, workdir)
     n_train = data["n_train"]
     Xtr_all = X.iloc[:n_train]
-    Xte = X.iloc[n_train:]
     Xs = Xtr_all.iloc[splits.search_idx].reset_index(drop=True)
     Xh = Xtr_all.iloc[splits.holdout_idx].reset_index(drop=True)
-    Xte = Xte.reset_index(drop=True)
+    Xte = X.iloc[n_train:].reset_index(drop=True)
     ys = data["y_search"]
-    folds = splits.fold_array(mode if mode in ("full", "screen", "alt") else "full")
-    K = int(folds.max()) + 1
     fast = mode in ("screen", "alt")
     need_ho_te = mode == "full"
     ho, te = None, None
@@ -503,7 +584,8 @@ def _experiment(job):
     n_feat = None
     seed_runs = []  # (oof, пройденные фолды) по сидам
     truncated, stop_reason = False, "ok"
-    _say(f"признаки построены за {time.time() - t0:.1f} с: {X.shape[1]} колонок; фолдов {K}, сиды {seeds}")
+    _say(f"базовые признаки за {time.time() - t0:.1f} с: {X.shape[1]} колонок; цепочка "
+         f"{config.get('features', {}).get('chain', [])}; фолды {ks}, сиды {seeds}")
 
     if model_name == "escape":
         import escape_contract
@@ -513,22 +595,30 @@ def _experiment(job):
         Rs = raw.iloc[:n_train].iloc[splits.search_idx].reset_index(drop=True)
         Rh = raw.iloc[:n_train].iloc[splits.holdout_idx].reset_index(drop=True)
         Rte = raw.iloc[n_train:].reset_index(drop=True)
-        oof, ho, te = escape_contract.run_escape(code, spec, Rs, ys, Rh, Rte, folds, deadline, need_ho_te)
-        seed_runs = [(oof, list(range(K)))]
+        oof, ho, te = escape_contract.run_escape(code, spec, Rs, ys, Rh, Rte, folds, deadline, need_ho_te, ks=ks)
+        seed_runs = [(oof, list(ks))]
         n_feat = raw.shape[1]
     else:
         n_runs = K * len(seeds)
+        prepared = {}
         for s in seeds:
             seed = int(job.get("seed", 42)) + int(s)
             oof, done = None, []
-            for k in range(K):
+            for k in ks:
                 if time.time() > deadline:
-                    truncated, stop_reason = True, f"дедлайн наступил перед фолдом {k + 1}/{K} (сид {s})"
+                    truncated, stop_reason = True, f"дедлайн наступил перед фолдом {k + 1} (сид {s})"
                     break
                 tf = time.time()
                 tr, va = folds != k, folds == k
-                others = [Xh, Xte] if need_ho_te else []
-                preds, bi, imp, n_feat, trunc = _fit_predict(config, spec, Xs[tr], ys[tr], Xs[va], ys[va], others,
+                if k not in prepared or len(seeds) == 1:
+                    prepared[k] = prepare_fold(config, spec, workdir, Xs[tr].reset_index(drop=True), ys[tr],
+                                               [Xs[va].reset_index(drop=True), Xh, Xte], _cache_spec(job, folds, k))
+                Xtr_k, (Xva_k, Xh_k, Xte_k) = prepared[k]
+                if len(seeds) == 1:
+                    prepared.pop(k, None)
+                tprep = time.time() - tf
+                others = [Xh_k, Xte_k] if need_ho_te else []
+                preds, bi, imp, n_feat, trunc = _fit_predict(config, spec, Xtr_k, ys[tr], Xva_k, ys[va], others,
                                                              seed, job["n_jobs"], fast, deadline, workdir)
                 if oof is None:
                     oof = np.zeros((len(ys),) + np.asarray(preds[0]).shape[1:])
@@ -541,11 +631,11 @@ def _experiment(job):
                     best_iters.append(bi)
                 for f, v in imp.items():
                     imp_total[f] = imp_total.get(f, 0.0) + v
-                _say(f"сид {s}, фолд {k + 1}/{K}: {time.time() - tf:.1f} с, итераций {bi}"
+                _say(f"сид {s}, фолд {k + 1}: {time.time() - tf:.1f} с (данные {tprep:.1f} с), итераций {bi}"
                      + (" — обучение остановлено по дедлайну" if trunc else ""))
                 _progress(job, f"сид {s}: фолдов {len(done)}/{K}, {time.time() - t0:.0f} с")
                 if trunc:
-                    truncated, stop_reason = True, f"обучение остановлено по дедлайну на фолде {k + 1}/{K} (сид {s})"
+                    truncated, stop_reason = True, f"обучение остановлено по дедлайну на фолде {k + 1} (сид {s})"
                     break
             seed_runs.append((oof, done))
             if truncated:
@@ -559,9 +649,13 @@ def _experiment(job):
               "best_iter": int(np.mean(best_iters)) if best_iters else None, "n_features": n_feat,
               "importance": [(f, round(v / total, 4)) for f, v in top_imp]}
 
+    def fold_score(o, k, post):
+        m = folds == k
+        return task_metrics.score(metric, ys[m], o[m], spec.task_type, post)
+
     if truncated:
         if complete:
-            oof, done = np.mean(complete, axis=0), list(range(K))
+            oof, done = np.mean(complete, axis=0), list(ks)
         else:
             oof, done = seed_runs[0] if seed_runs else (None, [])
         if oof is None or not done:
@@ -569,24 +663,21 @@ def _experiment(job):
                     "error": f"TimeoutError: {stop_reason}; ни один фолд не пройден", **common}
         mask = np.isin(folds, done)
         post = final_ensemble.fit_post(oof[mask], ys[mask], spec, config.get("postprocess", {}), metric)
-        fold_scores = [task_metrics.score(metric, ys[folds == k], oof[folds == k], spec.task_type, post)
-                       for k in done]
-        seed_means = [float(np.mean([task_metrics.score(metric, ys[folds == k], o[folds == k], spec.task_type, post)
-                                     for k in range(K)])) for o in complete]
-        return {"ok": True, "truncated": True, "stop_reason": stop_reason, "folds_done": done,
+        fold_scores = [fold_score(oof, k, post) for k in done]
+        seed_means = [float(np.mean([fold_score(o, k, post) for k in ks])) for o in complete]
+        return {"ok": True, "truncated": True, "stop_reason": stop_reason, "folds_done": [ks.index(k) for k in done],
                 "fold_scores": [float(v) for v in fold_scores], "mean": float(np.mean(fold_scores)),
                 "std": float(np.std(fold_scores)), "seed_means": seed_means, "preds_path": None, "post": post,
                 **common}
 
     oof = np.mean(complete, axis=0)
-    post = final_ensemble.fit_post(oof, ys, spec, config.get("postprocess", {}), metric)
-    fold_scores = [task_metrics.score(metric, ys[folds == k], oof[folds == k], spec.task_type, post)
-                   for k in range(K)]
-    seed_means = [float(np.mean([task_metrics.score(metric, ys[folds == k], o[folds == k], spec.task_type, post)
-                                 for k in range(K)])) for o in complete]
+    mask = np.isin(folds, ks)
+    post = final_ensemble.fit_post(oof[mask], ys[mask], spec, config.get("postprocess", {}), metric)
+    fold_scores = [fold_score(oof, k, post) for k in ks]
+    seed_means = [float(np.mean([fold_score(o, k, post) for k in ks])) for o in complete]
     import eval_acceptance
 
-    bad = eval_acceptance.output_check(oof, len(ys), spec.task_type if spec.task_type != "multi_regression"
+    bad = eval_acceptance.output_check(oof[mask], int(mask.sum()), spec.task_type if spec.task_type != "multi_regression"
                                        else "regression", spec.n_classes)
     if bad:
         raise ValueError(f"некорректный OOF: {bad}")
@@ -606,7 +697,8 @@ def _experiment(job):
 def _tune(job):
     """Optuna по параметрам модели лучшего узла на фолдах скрининга: до n_trials проб и до дедлайна.
 
-    Проба, в которой обучение остановлено по дедлайну, не засчитывается (TrialPruned).
+    Данные фолдов (цепочка transform) готовятся один раз. Проба, в которой обучение остановлено
+    по дедлайну, не засчитывается (TrialPruned).
     """
     import optuna
 
@@ -622,10 +714,16 @@ def _tune(job):
     X = build_features(config, data, spec, hints, workdir)
     Xs = X.iloc[: data["n_train"]].iloc[splits.search_idx].reset_index(drop=True)
     ys = data["y_search"]
-    folds = splits.folds_screen
-    K = int(folds.max()) + 1
+    folds = splits.fold_array("screen")
+    ks = splits.eval_folds("screen")
+    prepared = {}
+    for k in ks:
+        tr, va = folds != k, folds == k
+        prepared[k] = prepare_fold(config, spec, workdir, Xs[tr].reset_index(drop=True), ys[tr],
+                                   [Xs[va].reset_index(drop=True)], _cache_spec(job, folds, k))
     mod = model_module(config["model"]["name"])
     base_params = dict(config["model"].get("params") or {})
+    mask = np.isin(folds, ks)
 
     def objective(trial):
         tt = time.time()
@@ -633,11 +731,12 @@ def _tune(job):
         cfg2 = copy.deepcopy(config)
         cfg2["model"]["params"] = params
         oof = None
-        for k in range(K):
+        for k in ks:
             if time.time() > deadline - 5:
                 raise optuna.TrialPruned()
             tr, va = folds != k, folds == k
-            preds, _, _, _, trunc = _fit_predict(cfg2, spec, Xs[tr], ys[tr], Xs[va], ys[va], [],
+            Xtr_k, (Xva_k,) = prepared[k]
+            preds, _, _, _, trunc = _fit_predict(cfg2, spec, Xtr_k, ys[tr], Xva_k, ys[va], [],
                                                  int(job.get("seed", 42)), job["n_jobs"], True, deadline, workdir)
             if trunc:
                 _say(f"проба {trial.number}: обучение остановлено по дедлайну — не засчитана")
@@ -645,9 +744,9 @@ def _tune(job):
             if oof is None:
                 oof = np.zeros((len(ys),) + np.asarray(preds[0]).shape[1:])
             oof[va] = preds[0]
-        post = final_ensemble.fit_post(oof, ys, spec, config.get("postprocess", {}), metric)
+        post = final_ensemble.fit_post(oof[mask], ys[mask], spec, config.get("postprocess", {}), metric)
         s = float(np.mean([task_metrics.score(metric, ys[folds == k], oof[folds == k], spec.task_type, post)
-                           for k in range(K)]))
+                           for k in ks]))
         _say(f"проба {trial.number}: CV {s:.6g} за {time.time() - tt:.1f} с; {trial.params}")
         return task_metrics.gain(s, metric.greater_is_better)
 
@@ -688,16 +787,35 @@ def _refit(job):
                  max(5.0, job["deadline"] - time.time()))
         te = escape_contract.coerce(out[0], len(Xte), spec)
     else:
+        Xl_p, (Xte_p,) = prepare_fold(config, spec, workdir, Xl, yl, [Xte])
         for s in seeds:
             seed = int(job.get("seed", 42)) + int(s)
-            preds, _, _, _, trunc = _fit_predict(config, spec, Xl, yl, None, None, [Xte], seed, job["n_jobs"], False,
-                                                 job["deadline"], workdir, n_estimators=job.get("n_estimators"))
+            preds, _, _, _, trunc = _fit_predict(config, spec, Xl_p, yl, None, None, [Xte_p], seed, job["n_jobs"],
+                                                 False, job["deadline"], workdir, n_estimators=job.get("n_estimators"))
             truncated = truncated or trunc
             te = preds[0] / len(seeds) if te is None else te + preds[0] / len(seeds)
     path = workdir / "preds" / f"{job['node_id']}_refit.npz"
     np.savez(path, te=te)
     return {"ok": True, "preds_path": str(path), "truncated": truncated,
             "stop_reason": "обучение остановлено по дедлайну" if truncated else "ok"}
+
+
+def _materialize(job):
+    """Текущие данные решения (D3): цепочка на всех строках поиска → cur_train (строки поиска) и cur_test."""
+    spec, data, splits, hints = _load(job)
+    config = job["config"]
+    workdir = Path(job["workdir"])
+    X = build_features(config, data, spec, hints, workdir)
+    n_train = data["n_train"]
+    Xs = X.iloc[:n_train].iloc[splits.search_idx].reset_index(drop=True)
+    Xte = X.iloc[n_train:].reset_index(drop=True)
+    tr, (te,) = prepare_fold(config, spec, workdir, Xs, data["y_search"], [Xte])
+    out = Path(job["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    tr.to_pickle(out / "cur_train.pkl")
+    te.to_pickle(out / "cur_test.pkl")
+    return {"ok": True, "train_path": str(out / "cur_train.pkl"), "test_path": str(out / "cur_test.pkl"),
+            "n_columns": int(tr.shape[1])}
 
 
 def _adversarial(job):
@@ -758,6 +876,8 @@ def main():
             res = _refit(job)
         elif kind == "adversarial":
             res = _adversarial(job)
+        elif kind == "materialize":
+            res = _materialize(job)
         else:
             res = {"ok": False, "error": f"неизвестный вид задания {kind}"}
     except Exception as e:  # noqa: BLE001

@@ -64,17 +64,17 @@ def coerce(out, n: int, spec) -> np.ndarray:
     return a
 
 
-def run_escape(code, spec, Xs, ys, Xh, Xte, folds, deadline, predict_ho_te=True):
-    """OOF по фолдам + отдельный вызов для holdout и test. Возвращает (oof, ho, te)."""
+def run_escape(code, spec, Xs, ys, Xh, Xte, folds, deadline, predict_ho_te=True, ks=None):
+    """OOF по фолдам ks (по умолчанию — все) + отдельный вызов для holdout и test. Возвращает (oof, ho, te)."""
     fn = load_fn(code)
     spec_d = {"task_type": spec.task_type, "metric": spec.metric, "classes": list(spec.classes),
               "targets": list(spec.targets), "cat_cols": list(spec.cat_cols), "text_cols": list(spec.text_cols),
               "datetime_cols": list(spec.datetime_cols)}
-    K = int(folds.max()) + 1
+    ks = list(range(int(folds.max()) + 1)) if ks is None else list(ks)
     oof = None
-    for k in range(K):
+    for i, k in enumerate(ks):
         tr, va = folds != k, folds == k
-        budget = max(5.0, (deadline - time.time()) / (K - k + (1 if predict_ho_te else 0)))
+        budget = max(5.0, (deadline - time.time()) / (len(ks) - i + (1 if predict_ho_te else 0)))
         out = fn(Xs[tr].reset_index(drop=True), ys[tr], [Xs[va].reset_index(drop=True)], dict(spec_d), budget)
         p = coerce(out[0], int(va.sum()), spec)
         if oof is None:

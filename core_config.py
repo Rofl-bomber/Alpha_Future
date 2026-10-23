@@ -2,11 +2,12 @@
 
 Значения по умолчанию рассчитаны на платформу (3 часа, 8 CPU, 32 GB).
 Любое поле можно переопределить переменной окружения AGENT_<ИМЯ_ПОЛЯ_В_ВЕРХНЕМ_РЕГИСТРЕ>,
-например AGENT_TIME_BUDGET=1800 для 30-минутного прогона на стенде.
+например AGENT_TIME_BUDGET=1800 для 30-минутного прогона.
 
-Границы фаз — доли AGENT_TIME_BUDGET, переопределяются AGENT_PHASE_SPEC, AGENT_PHASE_L1,
-AGENT_PHASE_DIAG, AGENT_PHASE_SEARCH, AGENT_PHASE_RESEED, AGENT_PHASE_FINAL (числа в (0, 1],
-строго по возрастанию; иначе берутся значения по умолчанию).
+Границы фаз — доли AGENT_TIME_BUDGET, переопределяются AGENT_PHASE_SPEC, AGENT_PHASE_ANALYSIS,
+AGENT_PHASE_L1, AGENT_PHASE_SEARCH, AGENT_PHASE_RESEED, AGENT_PHASE_FINAL (числа в (0, 1],
+строго по возрастанию; иначе берутся значения по умолчанию). Границы анализа и L1 — потолки:
+если этап закончился раньше, следующий начинается сразу.
 
 AGENT_UNLIMITED=1 — режим без внутренних ограничений: время ограничивают только AGENT_TIME_BUDGET
 и границы фаз (каждое действие может идти до конца своей фазы), max_tokens в запросы к LLM не
@@ -18,18 +19,20 @@ import tempfile
 from dataclasses import asdict, dataclass, field, fields
 
 # Границы фаз — доли общего бюджета, считаются от старта solution.py.
-# 0–5 мин: задача и данные; 5–20: L1; 20–30: диагностика; 30–140: поиск;
-# 140–155: финалисты на сидах; 155–178: финальная сборка; 178–180: запись.
+# 0–3 мин: TaskSpec и константный сабмит; до 45: анализ данных (потолок); до 60: якорный L1 (потолок);
+# до 140: поиск (Preprocessing → Features → Model); 140–155: финалисты на сидах;
+# 155–178: финальная сборка; 178–180: запись.
 PHASES = {
-    "spec": 5 / 180,
-    "l1": 20 / 180,
-    "diag": 30 / 180,
+    "spec": 3 / 180,
+    "analysis": 45 / 180,
+    "l1": 60 / 180,
     "search": 140 / 180,
     "reseed": 155 / 180,
     "final": 178 / 180,
     "end": 1.0,
 }
-PHASE_ORDER = ("spec", "l1", "diag", "search", "reseed", "final", "end")
+PHASE_ORDER = ("spec", "analysis", "l1", "search", "reseed", "final", "end")
+STAGES = ("preprocessing", "features", "model")  # подэтапы поиска
 
 
 def detect_cpus() -> int:
@@ -107,37 +110,53 @@ class Config:
     noise_se_mult: float = 1.0
     min_delta_rel: float = 1e-4
     jump_rel: float = 0.15
-    leak_corr: float = 0.98
     fast_train_ratio: float = 0.3
     screen_if_full_s: float = 90.0  # скрининг включается, если полный прогон дольше
 
-    # Поиск (цепочкой от текущего решения)
-    plateau_restart: int = 6
-    diagnose_every_accepted: int = 3
+    # Анализ данных (Аналитик в Python-сессии)
+    analysis_steps: int = 60  # {steps} в промпте Аналитика
+    analysis_step_timeout_s: float = 120.0  # {timeout} в промпте: лимит одного запуска кода
+    analysis_max_out: int = 4000  # {max_out}: длиннее — вывод сокращается до начала и конца
+    analysis_step_max_tokens: int = 16000  # max_tokens одного шага Аналитика
+    analysis_temperature: float = 0.6
+    analysis_keep_full: int = 8  # столько последних обменов идёт в историю полностью, старые сокращаются
+    short_report_tokens: int = 2000  # объём короткой части A
+    kernel_threads: int = 2  # потоков у Python-сессии (параллельно идёт страховочный L1)
+    holdout_min_frac: float = 0.05  # допустимая доля holdout в submit_split
+    holdout_max_frac: float = 0.40
+    recall_steps: int = 15  # повторный вызов Аналитика: шаги и минуты
+    recall_minutes: float = 8.0
+
+    # Поиск: подэтапы Preprocessing → Features → Model, жадная цепочка от текущего решения
+    stage_pre_frac: float = 0.15
+    stage_feat_frac: float = 0.60
+    stage_model_frac: float = 0.25
+    plateau_n: int = 6  # столько отклонений подряд = плато подэтапа
     near_miss_per_accept: int = 2  # после принятия: сколько «почти прошедших» гипотез повторить на новом решении
     near_miss_total: int = 4  # и сколько таких повторов всего за прогон
-    example_rows: int = 5  # в промпт Исследователя: столько случайных строк и столько же худших по ошибке
-    tune_at_frac: float = 2 / 3
+    tune_at_frac: float = 2 / 3  # Optuna текущей модели — после этой доли подэтапа Model
     tune_trials: int = 40  # максимум проб Optuna за один запуск Tune
-    escape_min_left_s: float = 1800.0
     max_queue: int = 12
+    researcher_tool_steps: int = 8  # инструментальных шагов (python, read_report) на один вызов Исследователя
+    researcher_hypotheses: int = 4
+    critic_enabled: bool = False  # Критик — заглушка: всегда «принять» и «никого не исключать»
 
     # LLM
     llm_timeout_s: float = 300.0
     llm_retries: int = 3
     temperature: float = 0.3
-    token_limit_total: int = 1_200_000  # на один запуск (одну задачу); ~0,5 $ входа по ценам Qwen3.8-27B
-    token_limit_out: int = 250_000  # ~0,75 $ выхода
+    token_limit_total: int = 3_000_000  # на один запуск всех ролей, кроме Аналитика (Исследователь с инструментами)
+    token_limit_out: int = 400_000
+    token_limit_analyst: int = 2_000_000  # отдельный лимит Аналитика (анализ + повторные вызовы)
     engineer_thinking: int = 0  # 0 — просить сервер отключить размышления у Инженера
     researcher_max_tokens: int = 30000
     engineer_max_tokens: int = 15000
 
     # Инженер и песочница
-    react_max_steps: int = 8
-    engineer_submit_attempts: int = 2
+    engineer_attempts: int = 3  # попыток написать код, который проходит запуск на подвыборке
     sandbox_timeout_s: float = 120.0
     sample_rows: int = 2000
-    max_new_features: int = 30
+    cache_max_gb: float = 6.0  # кэш результата принятой цепочки transform по фолдам (на диске)
 
     # Финал
     finalists: int = 5

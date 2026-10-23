@@ -1,10 +1,10 @@
-"""Роли LLM поверх одной модели: Аналитик, Исследователь, Критик (Инженер — в llm_engineer.py).
+"""Простые роли LLM с ответом в JSON: сборка TaskSpec и Критик.
 
-У каждой роли короткий контекст и строгий JSON на выходе, проверяемый pydantic-схемой.
-Сырые данные в промпт не попадают — только сводки.
+Аналитик — в llm_analyst.py, Исследователь — в llm_researcher.py, Инженер — в llm_engineer.py.
+Критик по умолчанию — заглушка (cfg.critic_enabled=False): всегда «принять» и «никого не
+исключать», LLM не вызывается; интерфейсы сохранены, чтобы включить его позже.
 """
 
-import json
 import logging
 from typing import Any
 
@@ -16,7 +16,7 @@ import task_metrics
 log = logging.getLogger("agent")
 
 
-class AnalystOut(BaseModel):
+class SpecOut(BaseModel):
     task_type: str | None = None
     target: Any = None
     id_col: str | None = None
@@ -44,53 +44,6 @@ class AnalystOut(BaseModel):
         if v is None:
             return []
         return v if isinstance(v, list) else [str(v)]
-
-
-class Hypothesis(BaseModel):
-    kind: str = "config"
-    block: str = "model"
-    rationale: str = ""
-    patch: dict = Field(default_factory=dict)
-    feature_spec: str = ""
-    expected: str = ""
-    cost: str = "medium"
-
-    @field_validator("kind", "block", "cost", mode="before")
-    @classmethod
-    def _low(cls, v):
-        return str(v or "").strip().lower()
-
-    @field_validator("patch", mode="before")
-    @classmethod
-    def _patch(cls, v):
-        if v is None:
-            return {}
-        if isinstance(v, str):
-            try:
-                return json.loads(v)
-            except Exception:
-                return {}
-        return v
-
-    @field_validator("feature_spec", "rationale", "expected", mode="before")
-    @classmethod
-    def _text(cls, v):
-        if v is None:
-            return ""
-        return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-
-
-class ResearcherOut(BaseModel):
-    hypotheses: list[Hypothesis]
-    lessons: list[str] = Field(default_factory=list)
-
-    @field_validator("lessons", mode="before")
-    @classmethod
-    def _lessons(cls, v):
-        if v is None:
-            return []
-        items = v if isinstance(v, list) else [v]
-        return [str(x).strip() for x in items if str(x).strip()]
 
 
 class CriticOut(BaseModel):
@@ -126,27 +79,19 @@ class FinalCriticOut(BaseModel):
         return v if isinstance(v, list) else [v]
 
 
-def analyst(client, task_md: str, rules: str, columns: str, sample: str, timeout=None) -> dict:
-    system = llm_prompts.ANALYST_SYSTEM.format(metrics=", ".join(task_metrics.REGISTRY))
-    user = llm_prompts.ANALYST_USER.format(task_md=task_md[:14000], rules=rules, columns=columns[:12000],
-                                           sample=sample[:1500])
+def spec_reader(client, task_md: str, rules: str, columns: str, sample: str, timeout=None) -> dict:
+    """Технический шаг: уточнить TaskSpec (тип, таргет, метрика, файл сабмита) по task.md и сводке файлов."""
+    system = llm_prompts.SPEC_SYSTEM.format(metrics=", ".join(task_metrics.REGISTRY))
+    user = llm_prompts.SPEC_USER.format(task_md=task_md[:14000], rules=rules, columns=columns[:12000],
+                                        sample=sample[:1500])
     out = client.chat_json([{"role": "system", "content": system}, {"role": "user", "content": user}],
-                           role="analyst", schema=AnalystOut, max_tokens=client.cfg.researcher_max_tokens,
-                           timeout=timeout)
+                           role="spec", schema=SpecOut, max_tokens=client.cfg.researcher_max_tokens, timeout=timeout)
     return out.model_dump()
 
 
-def researcher(client, schema: str, n: int, context: dict, timeout=None) -> dict:
-    """Гипотезы и обновлённые «уроки» Исследователя: {"hypotheses": [...], "lessons": [...]}."""
-    system = llm_prompts.RESEARCHER_SYSTEM.format(schema=schema, n=n)
-    user = llm_prompts.RESEARCHER_USER.format(**context)
-    out = client.chat_json([{"role": "system", "content": system}, {"role": "user", "content": user}],
-                           role="researcher", schema=ResearcherOut, max_tokens=client.cfg.researcher_max_tokens,
-                           timeout=timeout)
-    return {"hypotheses": [h.model_dump() for h in out.hypotheses], "lessons": list(out.lessons)}
-
-
 def critic_jump(client, evidence: dict, timeout=None) -> dict:
+    if not client.cfg.critic_enabled:
+        return {"verdict": "accept", "reason": "Критик выключен (заглушка)"}
     user = llm_prompts.CRITIC_JUMP.format(**evidence)
     out = client.chat_json([{"role": "system", "content": llm_prompts.CRITIC_SYSTEM}, {"role": "user", "content": user}],
                            role="critic", schema=CriticOut, max_tokens=client.cfg.researcher_max_tokens,
@@ -155,6 +100,8 @@ def critic_jump(client, evidence: dict, timeout=None) -> dict:
 
 
 def critic_final(client, task: str, finalists: str, timeout=None) -> dict:
+    if not client.cfg.critic_enabled:
+        return {"exclude": [], "reason": "Критик выключен (заглушка)"}
     user = llm_prompts.CRITIC_FINAL.format(task=task, finalists=finalists)
     out = client.chat_json([{"role": "system", "content": llm_prompts.CRITIC_SYSTEM}, {"role": "user", "content": user}],
                            role="critic", schema=FinalCriticOut, max_tokens=client.cfg.researcher_max_tokens,

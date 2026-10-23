@@ -4,7 +4,8 @@
 Ответ модели очищается от блоков размышлений. JSON: сначала response_format (если сервер
 умеет), затем извлечение блока, починка и проверка pydantic-схемой с повторным запросом.
 Если лимит токенов на прогон исчерпан — LLMBudgetExceeded, оркестратор переходит
-на детерминированные операторы. В режиме AGENT_UNLIMITED лимитов токенов нет.
+на детерминированные операторы. У Аналитика (анализ, сжатие отчёта, повторные вызовы) отдельный
+лимит token_limit_analyst. В режиме AGENT_UNLIMITED лимитов токенов нет.
 """
 
 import ast
@@ -31,12 +32,29 @@ class LLMBudgetExceeded(LLMError):
 THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
+ANALYST_ROLES = ("analyst", "analyst_delta", "summarizer")
+
+
 def strip_think(text: str) -> str:
     if not text:
         return ""
     text = THINK_RE.sub("", text)
     if "</think>" in text:
         text = text.split("</think>")[-1]
+    return text.strip()
+
+
+def strip_paired_think(text: str) -> str:
+    """Убрать только парные блоки <think>…</think>; одиночный «</think>» внутри ответа не трогать.
+
+    Модель иногда пишет несколько шагов в одном ответе через фиктивный «</think>»: для циклов с кодом
+    важен ПЕРВЫЙ шаг, а strip_think оставил бы только последний.
+    """
+    if not text:
+        return ""
+    text = THINK_RE.sub("", text)
+    if text.lstrip().startswith("</think>"):
+        text = text.lstrip()[len("</think>"):]
     return text.strip()
 
 
@@ -103,10 +121,19 @@ class LLMClient:
             self.total_in += pin
             self.total_out += pout
 
-    def budget_left(self) -> bool:
+    def _totals(self, analyst: bool):
+        with self.lock:
+            rows = [u for r, u in self.usage.items() if (r in ANALYST_ROLES) == analyst]
+        return sum(u["in"] for u in rows), sum(u["out"] for u in rows)
+
+    def budget_left(self, role: str | None = None) -> bool:
         if self.cfg.unlimited:
             return True
-        return (self.total_in + self.total_out) < self.cfg.token_limit_total and self.total_out < self.cfg.token_limit_out
+        if role in ANALYST_ROLES:
+            pin, pout = self._totals(True)
+            return (pin + pout) < self.cfg.token_limit_analyst
+        pin, pout = self._totals(False)
+        return (pin + pout) < self.cfg.token_limit_total and pout < self.cfg.token_limit_out
 
     def _log(self, rec):
         try:
@@ -126,7 +153,7 @@ class LLMClient:
         return t_left
 
     def chat(self, messages, role: str, max_tokens: int | None = 4000, temperature=None, json_mode=False,
-             thinking=None, timeout=None) -> str:
+             thinking=None, timeout=None, strip: bool = True) -> str:
         """Один ответ модели.
 
         Сетевые и серверные ошибки — до cfg.llm_retries попыток с паузой. Если ответ обрезан по длине
@@ -135,8 +162,8 @@ class LLMClient:
         """
         if not self.available:
             raise LLMError("LLM не настроена: нет OPENAI_MODEL или OPENAI_API_KEY")
-        if not self.budget_left():
-            raise LLMBudgetExceeded("исчерпан лимит токенов на прогон")
+        if not self.budget_left(role):
+            raise LLMBudgetExceeded(f"исчерпан лимит токенов ({role})")
         if self.cfg.unlimited:
             max_tokens = None
         temperature = self.cfg.temperature if temperature is None else temperature
@@ -204,7 +231,7 @@ class LLMClient:
             msg = choice.message
             finish = getattr(choice, "finish_reason", None)
             raw = msg.content or ""
-            text = strip_think(raw)
+            text = strip_think(raw) if strip else strip_paired_think(raw)
             reasoning = getattr(msg, "reasoning_content", None) or ""
             usage = getattr(resp, "usage", None)
             pin = getattr(usage, "prompt_tokens", 0) or 0

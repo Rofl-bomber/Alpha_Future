@@ -1,14 +1,15 @@
-"""Конфигурация пайплайна и операторы над ней: патчи, проверка патчей, слияние, рестарт, библиотека.
+"""Конфигурация пайплайна и операторы над ней: патчи, проверка по подэтапам, рестарт, библиотека.
 
 Конфигурация — один JSON, полностью описывающий эксперимент:
   preprocess  {cat_encoding, missing_flags, rare_min_count}
-  features    {builtin: [...], custom: [...], drop: [...]}
+  features    {builtin: [...], chain: [...], drop: [...]}   chain — id кода transform Инженера по порядку
   target      {transform, class_weight, clip_quantile}
   model       {name, params, custom_id, escape_id}
   postprocess {class_weights_opt, threshold_opt, clip_to_train_range}
   training    {pseudo_label, pseudo_threshold}
 
 Патч — словарь «путь.через.точку → значение». Для списков: "+x" — добавить, "-x" — убрать.
+Ключи патча разделены по подэтапам поиска (STAGE_KEYS): в подэтапе принимаются только его ключи.
 """
 
 import copy
@@ -29,14 +30,28 @@ BOOLS = ("preprocess.missing_flags", "postprocess.class_weights_opt", "postproce
          "postprocess.clip_to_train_range", "training.pseudo_label")
 NUMS = {"preprocess.rare_min_count": (int, 0, 1000), "target.clip_quantile": (float, 0.0, 0.05),
         "training.pseudo_threshold": (float, 0.8, 0.999)}
-LISTS = ("features.builtin", "features.custom", "features.drop")
+LISTS = ("features.builtin", "features.chain", "features.drop")
+
+# какие ключи патча относятся к какому подэтапу поиска (features.chain пополняется только кодом Инженера)
+STAGE_KEYS = {
+    "preprocessing": ("preprocess.", "target.", "features.drop"),
+    "features": ("features.builtin",),
+    "model": ("model.", "training.", "postprocess."),
+}
+
+
+def key_stage(key: str):
+    for st, prefixes in STAGE_KEYS.items():
+        if any(key == p or (p.endswith(".") and key.startswith(p)) for p in prefixes):
+            return st
+    return None
 
 
 def default_config(spec) -> dict:
     metric = task_metrics.metric_for(spec)
     return {
         "preprocess": {"cat_encoding": "native", "missing_flags": False, "rare_min_count": 0},
-        "features": {"builtin": [], "custom": [], "drop": []},
+        "features": {"builtin": [], "chain": [], "drop": []},
         "target": {"transform": metric.target_transform if spec.task_type == "regression" else "none",
                    "class_weight": "none", "clip_quantile": 0.0},
         "model": {"name": "lgbm", "params": l1_params(spec), "custom_id": None, "escape_id": None},
@@ -122,11 +137,13 @@ def _coerce_num(v, typ, lo, hi):
     return max(typ(lo), min(typ(hi), x))
 
 
-def validate_patch(patch: dict, config: dict, spec, known_custom=(), hints=None, allow_params: bool = True) -> tuple:
+def validate_patch(patch: dict, config: dict, spec, known_custom=(), hints=None, allow_params: bool = True,
+                   stage: str | None = None) -> tuple:
     """Проверить и нормализовать патч LLM. Возвращает (чистый патч, список замечаний).
 
     allow_params=False — гиперпараметры модели отбрасываются (Исследователь их не предлагает,
-    их подбирает Optuna в харнессе).
+    их подбирает Optuna в харнессе). stage — ключи других подэтапов отбрасываются.
+    known_custom — id готового кода transform (для features.chain).
     """
     clean, notes = {}, []
     if not isinstance(patch, dict):
@@ -145,6 +162,9 @@ def validate_patch(patch: dict, config: dict, spec, known_custom=(), hints=None,
     walk("", patch)
     new_model = flat.get("model.name", _get(config, "model.name"))
     for k, v in flat.items():
+        if stage and k != "features.chain" and key_stage(k) not in (None, stage):
+            notes.append(f"{k} относится к подэтапу {key_stage(k)}, а сейчас {stage} — пропущено")
+            continue
         try:
             if k in ENUMS:
                 if v not in ENUMS[k]:
@@ -176,8 +196,8 @@ def validate_patch(patch: dict, config: dict, spec, known_custom=(), hints=None,
                     if k == "features.builtin" and name not in ops:
                         notes.append(f"операции {name} нет в библиотеке для этой задачи")
                         continue
-                    if k == "features.custom" and name not in known_custom:
-                        notes.append(f"признаков {name} нет")
+                    if k == "features.chain" and name not in known_custom:
+                        notes.append(f"кода transform {name} нет")
                         continue
                     if k == "features.drop" and name not in spec.feature_cols:
                         notes.append(f"колонки {name} нет среди признаков")
@@ -240,7 +260,7 @@ def describe_change(parent: dict, child: dict, custom_desc: dict | None = None) 
         added = [x for x in b if x not in a]
         removed = [x for x in a if x not in b]
         if added:
-            items = [f"{x} ({custom_desc[x][:120]})" if key == "features.custom" and x in custom_desc else str(x)
+            items = [f"{x} ({custom_desc[x][:120]})" if key == "features.chain" and x in custom_desc else str(x)
                      for x in added]
             parts.append(f"{key} += " + ", ".join(items))
         if removed:
@@ -275,11 +295,12 @@ def state_text(config: dict, custom_desc: dict | None = None, n_features=None) -
     if n_features:
         lines.append(f"- признаков в модели: {n_features}")
     lines.append("- features.builtin: " + (", ".join(f.get("builtin") or []) or "нет"))
-    custom = f.get("custom") or []
-    if custom:
-        lines.append("- features.custom: " + "; ".join(f"{c} ({custom_desc.get(c, '')[:120]})" for c in custom))
+    chain = f.get("chain") or []
+    if chain:
+        lines.append("- цепочка transform (по порядку): " + "; ".join(f"{c} ({custom_desc.get(c, '')[:140]})"
+                                                                     for c in chain))
     else:
-        lines.append("- features.custom: нет")
+        lines.append("- цепочка transform: пусто")
     lines.append("- features.drop: " + (", ".join(f.get("drop") or []) or "нет"))
     lines.append("- preprocess: " + ", ".join(f"{k}={_fmt(v)}" for k, v in pre.items()))
     tgt = {k: v for k, v in tg.items() if v not in (None, "none", 0, 0.0)}
@@ -323,69 +344,71 @@ def restart_options(spec, tried_families: set) -> list:
 
 
 def library(spec, prof: dict) -> list:
-    """Детерминированная очередь гипотез по приоритету (используется, когда LLM не ответила)."""
+    """Детерминированная очередь гипотез по подэтапам — запасной путь, когда LLM недоступна или молчит."""
     hyps = []
     t = prof.get("target", {})
 
-    def add(block, why, patch, cost="low"):
-        hyps.append({"kind": "config", "block": block, "rationale": why, "patch": patch, "cost": cost,
-                     "source": "library"})
+    def add(stage, block, why, patch, cost="low"):
+        hyps.append({"kind": "config", "stage": stage, "block": block, "rationale": why, "patch": patch,
+                     "cost": cost, "source": "library"})
 
     high_card = [c for c in spec.cat_cols if prof["columns"].get(c, {}).get("nunique", 0) > 30]
     if high_card:
-        add("preprocess", "target encoding высококардинальных категорий", {"preprocess.cat_encoding": "target_oof"})
-    if spec.cat_cols:
-        add("features", "частоты категорий", {"features.builtin": "+freq_enc"})
+        add("preprocessing", "preprocess", "target encoding высококардинальных категорий",
+            {"preprocess.cat_encoding": "target_oof"})
     if spec.task_type == "regression" and t.get("nonneg") and abs(t.get("skew", 0)) > 1:
-        add("target", "логарифм скошенного таргета", {"target.transform": "log1p"})
-    add("model", "CatBoost вместо LightGBM", {"model.name": "catboost"}, "medium")
-    if spec.cat_cols and spec.num_cols:
-        add("features", "средние числовых признаков по группам категорий", {"features.builtin": "+group_stats"})
+        add("preprocessing", "target", "логарифм скошенного таргета", {"target.transform": "log1p"})
     if any(v.get("miss_train", 0) > 0.01 for v in prof["columns"].values()):
-        add("preprocess", "флаги пропусков", {"preprocess.missing_flags": True})
+        add("preprocessing", "preprocess", "флаги пропусков", {"preprocess.missing_flags": True})
     if spec.task_type in ("binary", "multiclass") and t.get("imbalance", 1) > 5:
-        add("target", "веса редких классов", {"target.class_weight": "sqrt_balanced"})
-    add("model", "XGBoost", {"model.name": "xgb"}, "medium")
-    if len(spec.num_cols) >= 3:
-        add("features", "отношения важных числовых признаков", {"features.builtin": "+num_ratios"})
+        add("preprocessing", "target", "веса редких классов", {"target.class_weight": "sqrt_balanced"})
     adv = prof.get("adversarial") or {}
     if adv.get("auc") and adv["auc"] > 0.7:
         drift = [f for f, _ in adv.get("top", [])[:2] if f in spec.feature_cols]
         if drift:
-            add("features", f"убрать дрейфующие признаки {drift}", {"features.drop": drift})
-    if spec.task_type in ("binary", "multiclass"):
-        add("training", "псевдоразметка уверенных строк test", {"training.pseudo_label": True}, "high")
-    add("model", "более глубокие деревья и медленнее обучение",
-        {"model.params": {"num_leaves": 127, "learning_rate": 0.03, "min_child_samples": 30}}, "high")
-    add("model", "сильнее регуляризация", {"model.params": {"feature_fraction": 0.5, "lambda_l2": 10.0}})
+            add("preprocessing", "features", f"убрать дрейфующие признаки {drift}", {"features.drop": drift})
+    if spec.cat_cols:
+        add("features", "features", "частоты категорий", {"features.builtin": "+freq_enc"})
+    if spec.cat_cols and spec.num_cols:
+        add("features", "features", "средние числовых признаков по группам категорий",
+            {"features.builtin": "+group_stats"})
+    if len(spec.num_cols) >= 3:
+        add("features", "features", "отношения важных числовых признаков", {"features.builtin": "+num_ratios"})
     if spec.cat_cols and len(spec.cat_cols) >= 2:
-        add("features", "сочетания категорий", {"features.builtin": "+cat_combos"})
+        add("features", "features", "сочетания категорий", {"features.builtin": "+cat_combos"})
     if spec.text_cols:
-        add("features", "TF-IDF + SVD текста", {"features.builtin": "+text_tfidf_svd"}, "medium")
-    add("model", "ExtraTrees для разнообразия бленда", {"model.name": "extratrees"}, "medium")
+        add("features", "features", "TF-IDF + SVD текста", {"features.builtin": "+text_tfidf_svd"}, "medium")
+    add("features", "features", "число повторов строки признаков", {"features.builtin": "+dup_count"})
+    add("model", "model", "CatBoost вместо LightGBM", {"model.name": "catboost"}, "medium")
+    add("model", "model", "XGBoost", {"model.name": "xgb"}, "medium")
+    if spec.task_type in ("binary", "multiclass"):
+        add("model", "training", "псевдоразметка уверенных строк test", {"training.pseudo_label": True}, "high")
+    add("model", "model", "ExtraTrees для разнообразия бленда", {"model.name": "extratrees"}, "medium")
     return hyps
 
 
-def schema_text(spec, hints=None) -> str:
-    """Описание допустимых патчей для промпта Исследователя (без гиперпараметров — их подбирает харнесс)."""
+def schema_text(spec, stage: str, hints=None) -> str:
+    """Допустимые ключи патча (kind=config) в подэтапе — для промпта Исследователя."""
     ops = feat_builtin.applicable_ops(spec, hints)
-    lines = [
-        "Допустимые ключи патча к текущему решению (значение заменяет текущее; для списков \"+x\" добавляет, "
-        "\"-x\" убирает):",
-        f"- preprocess.cat_encoding: {list(feat_builtin.ENCODINGS)}" if spec.cat_cols else "",
-        "- preprocess.missing_flags: true|false; preprocess.rare_min_count: 0..1000",
-        "- features.builtin: операции библиотеки: " + "; ".join(f"{o} — {feat_builtin.OPS_DOC[o]}" for o in ops),
-        "- features.drop: имена исходных колонок, которые убрать",
-        "- features.custom: id готовых LLM-признаков (новые создаются гипотезой kind=feature_code)",
-    ]
-    if spec.task_type == "regression":
-        lines.append("- target.transform: none|log1p|sqrt (метрика всегда считается в исходной шкале); "
-                     "target.clip_quantile: 0..0.05 (обрезка выбросов таргета в обучении)")
-    if spec.task_type in ("binary", "multiclass"):
-        lines.append("- target.class_weight: none|balanced|sqrt_balanced")
-        lines.append("- training.pseudo_label: true|false; training.pseudo_threshold: 0.8..0.999")
-    lines.append("- model.name: " + "|".join(MODEL_MODULES)
-                 + " — другое семейство моделей на тех же признаках; гиперпараметры подбирает харнесс, "
-                   "ключи model.params не принимаются")
-    lines.append("- postprocess.class_weights_opt / threshold_opt / clip_to_train_range: true|false")
-    return "\n".join(x for x in lines if x)
+    lines = [f"Config patch keys allowed in stage {stage} (a value replaces the current one; for lists \"+x\" adds, "
+             "\"-x\" removes):"]
+    if stage == "preprocessing":
+        if spec.cat_cols:
+            lines.append(f"- preprocess.cat_encoding: {list(feat_builtin.ENCODINGS)}")
+        lines.append("- preprocess.missing_flags: true|false; preprocess.rare_min_count: 0..1000")
+        lines.append("- features.drop: names of raw columns to drop")
+        if spec.task_type == "regression":
+            lines.append("- target.transform: none|log1p|sqrt (the metric is always computed on the original scale); "
+                         "target.clip_quantile: 0..0.05 (clip target outliers in training)")
+        if spec.task_type in ("binary", "multiclass"):
+            lines.append("- target.class_weight: none|balanced|sqrt_balanced")
+    elif stage == "features":
+        lines.append("- features.builtin: library operations: " + "; ".join(f"{o} — {feat_builtin.OPS_DOC[o]}"
+                                                                           for o in ops))
+    else:
+        lines.append("- model.name: " + "|".join(MODEL_MODULES) + " — another model family on the same data; "
+                     "hyperparameters are tuned by the harness, model.params keys are not accepted")
+        if spec.task_type in ("binary", "multiclass"):
+            lines.append("- training.pseudo_label: true|false; training.pseudo_threshold: 0.8..0.999")
+        lines.append("- postprocess.class_weights_opt / threshold_opt / clip_to_train_range: true|false")
+    return "\n".join(lines)
