@@ -1,9 +1,10 @@
 """Постоянная Python-сессия (как ноутбук) для Аналитика и Исследователя.
 
-Родитель (Kernel) запускает `python exp_kernel.py conf.json <fd>` в отдельной группе процессов
+Родитель (Kernel) запускает `python exp_kernel.py conf.json` в отдельной группе процессов
 (виден watchdog через ProcessRegistry), без ключей OPENAI_* в окружении и с ограничением потоков.
-Запросы идут JSON-строкой в stdin, ответы — JSON-строкой в отдельный канал <fd>, поэтому вывод
-кода пользователя не смешивается с протоколом. Сессия живёт весь прогон.
+Запросы идут JSON-строкой в stdin, ответы — JSON-строкой в stdout. Ребёнок сразу уводит свой
+дескриптор 1 в лог (stderr), а для протокола оставляет его копию, поэтому вывод кода пользователя
+и библиотек не смешивается с протоколом. Работает и на Linux, и на Windows. Сессия живёт весь прогон.
 
 В пространстве имён: train, test, data_dictionary, sample_submission (сырые таблицы), pd, np и
 функция харнесса submit_split. Харнесс подгружает туда же текущее решение (load).
@@ -13,16 +14,17 @@
 - stdout и stderr перехватываются, warnings выключены, длинный вывод сокращается до начала и конца;
 - train / test и другие таблицы харнесса защищены: если шаг их подменил или изменил колонки
   и форму, они восстанавливаются из эталона, а в вывод добавляется предупреждение;
-- таймаут шага прерывает код сигналом, сессия и переменные сохраняются; если код не реагирует,
+- таймаут шага прерывает код (SIGALRM, на Windows — прерывание из потока-таймера), сессия и переменные сохраняются; если код не реагирует,
   родитель убивает процесс и запускает сессию заново (переменные теряются, об этом сказано в выводе).
 """
 
 import ast
 import contextlib
 import io
+import _thread
 import json
 import os
-import select
+import queue
 import signal
 import subprocess
 import sys
@@ -46,7 +48,7 @@ class Kernel:
         self.conf = dict(conf)
         self.log = log
         self.proc = None
-        self.rfd = None
+        self.q = None  # строки протокола из stdout ребёнка (читает поток)
         self.lock = threading.Lock()
         self.loaded = {}  # что подгружено харнессом: после перезапуска подгружается снова
         self.restarts = 0
@@ -62,16 +64,15 @@ class Kernel:
         kdir = self.ctx.p("kernel", "conf.json").parent
         conf_path = kdir / "conf.json"
         conf_path.write_text(json.dumps(self.conf, ensure_ascii=False, default=str), encoding="utf-8")
-        r, w = os.pipe()
         log_path = self.ctx.p("logs", "kernel.log")
         lf = open(log_path, "a", encoding="utf-8")
         env = exp_runner.child_env(int(self.conf.get("threads", 2)))
-        self.proc = subprocess.Popen([sys.executable, "-u", str(HERE / "exp_kernel.py"), str(conf_path), str(w)],
-                                     stdin=subprocess.PIPE, stdout=lf, stderr=subprocess.STDOUT,
-                                     pass_fds=(w,), env=env, cwd=str(self.ctx.workdir), start_new_session=True)
-        os.close(w)
+        self.proc = subprocess.Popen([sys.executable, "-u", str(HERE / "exp_kernel.py"), str(conf_path)],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=lf,
+                                     env=env, cwd=str(self.ctx.workdir), start_new_session=True)
         lf.close()
-        self.rfd = r
+        self.q = queue.Queue()
+        threading.Thread(target=_pump, args=(self.proc.stdout, self.q), daemon=True).start()
         self.ctx.registry.add(self.proc)
         res = self._read(timeout)
         if not res.get("ok"):
@@ -87,26 +88,23 @@ class Kernel:
         self.proc.stdin.flush()
 
     def _read(self, timeout: float) -> dict:
-        buf = b""
         t_end = time.time() + timeout
         while True:
             left = t_end - time.time()
             if left <= 0:
                 return {"ok": False, "timeout": True, "error": "нет ответа сессии"}
-            ready, _, _ = select.select([self.rfd], [], [], min(left, 1.0))
-            if not ready:
-                if not self.alive:
+            try:
+                line = self.q.get(timeout=min(left, 1.0))
+            except queue.Empty:
+                if not self.alive and self.q.empty():
                     return {"ok": False, "dead": True, "error": "процесс сессии завершился"}
                 continue
-            chunk = os.read(self.rfd, 1 << 20)
-            if not chunk:
+            if line is None:
                 return {"ok": False, "dead": True, "error": "процесс сессии завершился"}
-            buf += chunk
-            if buf.endswith(b"\n"):
-                try:
-                    return json.loads(buf.decode("utf-8"))
-                except json.JSONDecodeError:
-                    continue
+            try:
+                return json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
 
     def request(self, obj: dict, timeout: float) -> dict:
         with self.lock:
@@ -132,11 +130,7 @@ class Kernel:
         if self.proc is not None:
             kill_tree(self.proc.pid)
             self.ctx.registry.remove(self.proc)
-        if self.rfd is not None:
-            try:
-                os.close(self.rfd)
-            except OSError:
-                pass
+            _close_pipes(self.proc)
         self.restarts += 1
         if self.log:
             self.log.warning("Python-сессия перезапущена (%d-й раз)", self.restarts)
@@ -163,13 +157,26 @@ class Kernel:
                 pass
             kill_tree(self.proc.pid)
             self.ctx.registry.remove(self.proc)
+            _close_pipes(self.proc)
             self.proc = None
-        if self.rfd is not None:
-            try:
-                os.close(self.rfd)
-            except OSError:
-                pass
-            self.rfd = None
+
+
+def _pump(stream, q):
+    """Поток родителя: строки протокола из stdout ребёнка в очередь; None — конец потока."""
+    try:
+        for line in iter(stream.readline, b""):
+            q.put(line)
+    except Exception:
+        pass
+    q.put(None)
+
+
+def _close_pipes(proc):
+    for f in (proc.stdin, proc.stdout):
+        try:
+            f.close()
+        except Exception:
+            pass
 
 
 # =====================================================================================
@@ -179,6 +186,10 @@ class Kernel:
 
 class StepTimeout(BaseException):
     pass
+
+
+TIMEOUT_MSG = ("\nTIMEOUT: код выполнялся дольше {timeout:.0f} с и был прерван. "
+               "Переменные сессии сохранены; ускорьте код (подвыборка, векторизация).")
 
 
 def _cut(text: str, limit: int) -> str:
@@ -254,30 +265,48 @@ class Session:
         buf = io.StringIO()
         self.code = code
 
+        fired = []
+        use_alarm = hasattr(signal, "setitimer")
+        timer = None
+
         def on_alarm(signum, frame):
             raise StepTimeout()
 
-        signal.signal(signal.SIGALRM, on_alarm)
-        signal.setitimer(signal.ITIMER_REAL, max(1.0, float(timeout)))
+        def on_timer():  # Windows: SIGALRM нет — прерываем главный поток
+            fired.append(1)
+            _thread.interrupt_main()
+
+        if use_alarm:
+            signal.signal(signal.SIGALRM, on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, max(1.0, float(timeout)))
+        else:
+            timer = threading.Timer(max(1.0, float(timeout)), on_timer)
+            timer.daemon = True
+            timer.start()
         try:
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                tree = ast.parse(code, "<step>", "exec")
-                last = tree.body[-1] if tree.body and isinstance(tree.body[-1], ast.Expr) else None
-                body = tree.body[:-1] if last is not None else tree.body
-                exec(compile(ast.Module(body=body, type_ignores=[]), "<step>", "exec"), self.ns)
-                if last is not None:
-                    v = eval(compile(ast.Expression(last.value), "<step>", "eval"), self.ns)
-                    if v is not None:
-                        print(repr(v))
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    tree = ast.parse(code, "<step>", "exec")
+                    last = tree.body[-1] if tree.body and isinstance(tree.body[-1], ast.Expr) else None
+                    body = tree.body[:-1] if last is not None else tree.body
+                    exec(compile(ast.Module(body=body, type_ignores=[]), "<step>", "exec"), self.ns)
+                    if last is not None:
+                        v = eval(compile(ast.Expression(last.value), "<step>", "eval"), self.ns)
+                        if v is not None:
+                            print(repr(v))
+            finally:
+                if use_alarm:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                else:
+                    timer.cancel()
         except StepTimeout:
-            buf.write(f"\nTIMEOUT: код выполнялся дольше {timeout:.0f} с и был прерван. "
-                      f"Переменные сессии сохранены; ускорьте код (подвыборка, векторизация).")
+            buf.write(TIMEOUT_MSG.format(timeout=timeout))
+        except KeyboardInterrupt:
+            buf.write(TIMEOUT_MSG.format(timeout=timeout) if fired else "\nKeyboardInterrupt")
         except SyntaxError as e:
             buf.write(f"\nSyntaxError: {e.msg} (строка {e.lineno}): {(e.text or '').strip()}")
         except BaseException as e:  # noqa: BLE001
             buf.write("\n" + _format_error(e))
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
         out = buf.getvalue()
         notes = self._check_guard()
         if notes:
@@ -385,7 +414,19 @@ def main():
     warnings.filterwarnings("ignore")
     sys.path.insert(0, str(HERE))
     conf = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    out = os.fdopen(int(sys.argv[2]), "w", encoding="utf-8")
+    # Канал протокола — копия исходного stdout; сам дескриптор 1 уводим в лог (stderr), чтобы
+    # печать из C-кода и библиотек не попадала в протокол.
+    out = os.fdopen(os.dup(1), "w", encoding="utf-8", newline="\n")
+    try:
+        sys.stdout.flush()
+        os.dup2(2, 1)
+    except OSError:
+        pass
+    if not hasattr(signal, "setitimer"):  # Windows: таймаут шага идёт через interrupt_main
+        try:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        except Exception:
+            pass
 
     def send(obj):
         out.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
@@ -397,29 +438,37 @@ def main():
         send({"ok": False, "error": f"{type(e).__name__}: {e}"})
         return
     send({"ok": True, "ready": True})
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    while True:
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            send({"ok": False, "error": "неразборчивый запрос"})
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                send({"ok": False, "error": "неразборчивый запрос"})
+                continue
+            op = req.get("op")
+            if op == "exit":
+                break
+            try:
+                if op == "exec":
+                    send({"ok": True, "output": sess.run(req.get("code", ""), float(req.get("timeout", 120)))})
+                elif op == "load":
+                    send({"ok": True, "output": sess.load(req.get("items", {}))})
+                elif op == "ping":
+                    send({"ok": True, "output": "pong"})
+                else:
+                    send({"ok": False, "error": f"неизвестная операция {op}"})
+            except KeyboardInterrupt:
+                raise
+            except BaseException as e:  # noqa: BLE001
+                send({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        except KeyboardInterrupt:  # запоздалое прерывание таймера между шагами — не выходим
             continue
-        op = req.get("op")
-        if op == "exit":
-            break
-        try:
-            if op == "exec":
-                send({"ok": True, "output": sess.run(req.get("code", ""), float(req.get("timeout", 120)))})
-            elif op == "load":
-                send({"ok": True, "output": sess.load(req.get("items", {}))})
-            elif op == "ping":
-                send({"ok": True, "output": "pong"})
-            else:
-                send({"ok": False, "error": f"неизвестная операция {op}"})
-        except BaseException as e:  # noqa: BLE001
-            send({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 if __name__ == "__main__":

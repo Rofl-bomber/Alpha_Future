@@ -77,20 +77,22 @@ def kill_tree(pid: int):
             parent = psutil.Process(pid)
             children = parent.children(recursive=True)
         except psutil.NoSuchProcess:
-            children = []
-        for child in children:
+            parent, children = None, []
+        for child in children + ([parent] if parent is not None else []):
             try:
                 child.kill()
             except Exception:
                 pass
     except Exception:
         pass
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM)  # на Windows SIGKILL нет; SIGTERM = TerminateProcess
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, sig)
+        except Exception:
+            pass
     try:
-        os.killpg(pid, signal.SIGKILL)
-    except Exception:
-        pass
-    try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, sig)
     except Exception:
         pass
 
