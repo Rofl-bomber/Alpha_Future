@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 submission.zip
 agent_run_*/
+.venv/

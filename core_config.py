@@ -116,11 +116,11 @@ class Config:
     # Анализ данных (Аналитик в Python-сессии)
     analysis_steps: int = 60  # {steps} в промпте Аналитика
     analysis_step_timeout_s: float = 120.0  # {timeout} в промпте: лимит одного запуска кода
-    analysis_max_out: int = 4000  # {max_out}: длиннее — вывод сокращается до начала и конца
+    analysis_max_out: int = 8000  # {max_out}: длиннее — вывод сокращается до начала и конца
     analysis_step_max_tokens: int = 16000  # max_tokens одного шага Аналитика
     analysis_temperature: float = 0.6
     analysis_keep_full: int = 8  # столько последних обменов идёт в историю полностью, старые сокращаются
-    short_report_tokens: int = 2000  # объём короткой части A
+    short_report_tokens: int = 4000  # объём короткой части A
     kernel_threads: int = 2  # потоков у Python-сессии (параллельно идёт страховочный L1)
     holdout_min_frac: float = 0.05  # допустимая доля holdout в submit_split
     holdout_max_frac: float = 0.40
@@ -152,16 +152,16 @@ class Config:
     temperature: float = 0.3
     # Лимиты токенов на прогон — у каждой роли свои (вход + выход; у части ролей ещё отдельно выход), чтобы
     # одна роль не съедала бюджет другой. Размышления модели входят в выходные токены.
-    token_limit_analyst: int = 2_000_000  # Аналитик: анализ, сжатие отчёта, повторные вызовы
-    token_limit_researcher: int = 2_000_000
-    token_limit_researcher_out: int = 600_000
-    token_limit_engineer: int = 1_500_000
+    token_limit_analyst: int = 3_000_000  # Аналитик: анализ, сжатие отчёта, повторные вызовы
+    token_limit_researcher: int = 3_000_000
+    token_limit_researcher_out: int = 1_000_000
+    token_limit_engineer: int = 2_000_000
     token_limit_engineer_out: int = 900_000
     token_limit_critic: int = 800_000  # Критик кода (и Критик скачков и финалистов, если включён)
     token_limit_critic_out: int = 300_000
     token_limit_other: int = 300_000  # прочие роли (чтение TaskSpec)
     engineer_thinking: int = 0  # 0 — просить сервер отключить размышления у Инженера
-    researcher_max_tokens: int = 30000
+    researcher_max_tokens: int = 40000
     engineer_max_tokens: int = 32000  # размышления успешных ответов на сложных гипотезах — до ~13.5 тыс. токенов
 
     # Инженер и песочница
