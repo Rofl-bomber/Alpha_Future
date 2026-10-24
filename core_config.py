@@ -139,7 +139,9 @@ class Config:
     max_queue: int = 12
     researcher_tool_steps: int = 8  # инструментальных шагов (python, read_report) на один вызов Исследователя
     researcher_hypotheses: int = 4
-    critic_enabled: bool = False  # Критик — заглушка: всегда «принять» и «никого не исключать»
+    critic_enabled: bool = False  # Критик скачков и финалистов — заглушка: всегда «принять» и «никого не исключать»
+    code_critic: bool = True  # Критик кода: сверка просьбы, кода transform и сводки результата; одна попытка исправить
+    critic_max_tokens: int = 16000
 
     # LLM
     llm_timeout_s: float = 300.0
@@ -154,8 +156,8 @@ class Config:
 
     # Инженер и песочница
     engineer_attempts: int = 3  # попыток написать код, который проходит запуск на подвыборке
-    sandbox_timeout_s: float = 120.0
-    sample_rows: int = 2000
+    sandbox_timeout_s: float = 180.0  # transform проверяется на настоящем фолде на полных данных
+    sample_rows: int = 2000  # подвыборка для проверки CustomModel и fit_predict
     cache_max_gb: float = 6.0  # кэш результата принятой цепочки transform по фолдам (на диске)
 
     # Финал

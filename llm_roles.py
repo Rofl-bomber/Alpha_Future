@@ -1,8 +1,9 @@
-"""Простые роли LLM с ответом в JSON: сборка TaskSpec и Критик.
+"""Простые роли LLM с ответом в JSON: сборка TaskSpec, Критик и Критик кода.
 
 Аналитик — в llm_analyst.py, Исследователь — в llm_researcher.py, Инженер — в llm_engineer.py.
-Критик по умолчанию — заглушка (cfg.critic_enabled=False): всегда «принять» и «никого не
-исключать», LLM не вызывается; интерфейсы сохранены, чтобы включить его позже.
+Критик скачков и финалистов по умолчанию — заглушка (cfg.critic_enabled=False): всегда «принять»
+и «никого не исключать», LLM не вызывается. Критик кода (cfg.code_critic) сверяет просьбу
+Исследователя, код Инженера и сводку того, что код выдал на настоящем фолде; права вето у него нет.
 """
 
 import logging
@@ -87,6 +88,32 @@ def spec_reader(client, task_md: str, rules: str, columns: str, sample: str, tim
     out = client.chat_json([{"role": "system", "content": system}, {"role": "user", "content": user}],
                            role="spec", schema=SpecOut, max_tokens=client.cfg.researcher_max_tokens, timeout=timeout)
     return out.model_dump()
+
+
+class CodeCriticOut(BaseModel):
+    ok: bool = True
+    issues: list = Field(default_factory=list)
+
+    @field_validator("issues", mode="before")
+    @classmethod
+    def _issues(cls, v):
+        if v is None:
+            return []
+        return [str(x) for x in v] if isinstance(v, list) else [str(v)]
+
+
+def code_critic(client, hypothesis: str, contract: str, code: str, summary: str, timeout=None) -> dict:
+    """Сверка просьбы, кода и результата. Возвращает {"ok", "issues"}; LLMError — наружу."""
+    user = llm_prompts.CODE_CRITIC_USER.format(hypothesis=hypothesis, contract=contract, code=code[:20000],
+                                               summary=summary[:8000])
+    out = client.chat_json([{"role": "system", "content": llm_prompts.CODE_CRITIC_SYSTEM},
+                            {"role": "user", "content": user}],
+                           role="critic", schema=CodeCriticOut, max_tokens=client.cfg.critic_max_tokens,
+                           timeout=timeout)
+    d = out.model_dump()
+    d["issues"] = [x.strip() for x in d["issues"] if x and x.strip()]
+    d["ok"] = bool(d["ok"]) and not d["issues"]
+    return d
 
 
 def critic_jump(client, evidence: dict, timeout=None) -> dict:

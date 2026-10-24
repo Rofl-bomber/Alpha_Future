@@ -491,6 +491,50 @@ ENGINEER_USER = """# Task
 ENGINEER_FIX = "The sample run failed:\n{error}\nFix the code and reply with the full corrected ```python``` block."
 ENGINEER_CUT = ("Your previous answer was cut off by the length limit before any code block. Reply now with the full "
                 "```python``` block of the slot; keep the reasoning short.")
+ENGINEER_REVIEW = """The code ran on a real fold. What it produced (per new or changed column: statistics on the training
+part train_df and on each frame of others):
+{summary}
+
+A reviewer compared the code and this result with the spec and found possible problems:
+{issues}
+
+If a problem is real, fix the code and reply with the full corrected ```python``` block. If the code is correct,
+reply with the same code in a ```python``` block and one line explaining why."""
+
+# ====================================================================== Критик кода Инженера
+
+CODE_CRITIC_SYSTEM = """You review code written by the Engineer of an autonomous ML agent before it is used in an
+experiment. You get what the Researcher asked for (the spec), the slot contract, the code, and a summary of what the
+code produced on a real fold: for every new or changed column, statistics on the training part (train_df) and on
+each frame of others (the validation part of the fold, the holdout, test).
+
+Report only mismatches that would make the experiment test something other than what was asked:
+- the code computes something different from the spec: another formula, aggregation, key, set of rows or columns,
+  or a missing part;
+- a column is produced for the rows of train_df by a different procedure than for the rows of others. Compare the
+  code paths and the statistics. Some difference is expected (for train_df rows statistics come from other parts of
+  train_df, for others from the whole train_df), but not a different scale, level or meaning;
+- the result contradicts the spec: a constant or fully missing column, impossible values.
+Do not comment on style, speed or naming, and do not suggest other features or ideas.
+
+Answer with ONE JSON object and nothing else:
+{"ok": true or false, "issues": ["one concrete problem per item, in Russian: the column, what is wrong, the numbers or the line of code"]}
+ok = true and an empty list if the code and the result match the spec."""
+
+CODE_CRITIC_USER = """# What the Researcher asked for
+{hypothesis}
+
+# Slot contract
+{contract}
+
+# Code
+```python
+{code}
+```
+
+# What the code produced on a real fold
+{summary}
+"""
 
 # ====================================================================== Критик (по умолчанию — заглушка)
 

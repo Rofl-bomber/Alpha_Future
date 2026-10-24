@@ -146,3 +146,47 @@ def describe_diff(before: pd.DataFrame, after: pd.DataFrame, limit: int = 40) ->
     if removed:
         lines.append("  удалены: " + ", ".join(removed[:limit]))
     return "\n".join(lines)
+
+
+def summary_frames(before: pd.DataFrame, after: list, names: list, limit: int = 15) -> str:
+    """Что получилось у transform по кадрам фолда: для каждой добавленной или изменённой колонки — статистика
+    на обучающей части и на каждом кадре others (доля пропусков, min, медиана, среднее, max; у категорий —
+    число значений и самое частое). Показывается Инженеру и Критику кода, пишется в журнал."""
+    tr = after[0]
+    b = set(before.columns)
+    added = [c for c in tr.columns if c not in b]
+    changed = []
+    for c in tr.columns:
+        if c in b and c not in added:
+            x, y = before[c], tr[c]
+            try:
+                same = str(x.dtype) == str(y.dtype) and x.reset_index(drop=True).equals(y.reset_index(drop=True))
+            except Exception:
+                same = False
+            if not same:
+                changed.append(c)
+    removed = [c for c in before.columns if c not in set(tr.columns)]
+    lines = [f"колонок было {before.shape[1]}, стало {tr.shape[1]}; добавлено {len(added)}, изменено {len(changed)}, "
+             f"удалено {len(removed)}; строк: " + ", ".join(f"{n} {len(f)}" for n, f in zip(names, after))]
+    cols = [(c, "добавлена") for c in added] + [(c, "изменена") for c in changed]
+    for c, what in cols[:limit]:
+        lines.append(f"{c} ({what}):")
+        for n, f in zip(names, after):
+            s = f[c]
+            miss = s.isna().mean()
+            if isinstance(s.dtype, pd.CategoricalDtype) or not pd.api.types.is_numeric_dtype(s):
+                vc = s.value_counts(dropna=True)
+                top = f"{vc.index[0]!s:.30} ({vc.iloc[0] / max(len(s), 1):.0%})" if len(vc) else "—"
+                lines.append(f"  {n:<10} NaN {miss:6.1%}  значений {s.nunique()}  частое {top}")
+            else:
+                v = s.astype(float)
+                if v.notna().any():
+                    lines.append(f"  {n:<10} NaN {miss:6.1%}  min {v.min():.4g}  медиана {v.median():.4g}  "
+                                 f"среднее {v.mean():.4g}  max {v.max():.4g}")
+                else:
+                    lines.append(f"  {n:<10} NaN {miss:6.1%}  (все значения пропущены)")
+    if len(cols) > limit:
+        lines.append(f"... и ещё {len(cols) - limit} колонок")
+    if removed:
+        lines.append("удалены: " + ", ".join(removed[:limit]))
+    return "\n".join(lines)

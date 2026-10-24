@@ -1,10 +1,13 @@
 """Песочница для кода Инженера: transform (Preprocessing, Features), CustomModel, fit_predict.
 
 Код исполняется в отдельном процессе (`python feat_sandbox.py job.json`) с таймаутом и лимитом
-памяти, без ключей LLM в окружении, на подвыборке строк поиска: обучающая часть (75%), валидационная
-(25%) и кусочки holdout и test — те же роли кадров, что в настоящем фолде. Сначала применяется
-принятая цепочка текущего решения, затем новый код. Проверяется форма выхода (feat_transform.normalize),
-Инженеру возвращается, что код сделал с колонками, или ошибка.
+памяти, без ключей LLM в окружении. Сначала применяется принятая цепочка текущего решения, затем
+новый код. Проверяется форма выхода (feat_transform.normalize).
+
+transform запускается на настоящем фолде на полных данных: обучающая часть — строки поиска вне
+первого фолда, others — строки первого фолда, весь holdout и весь test (групповые признаки на
+подвыборке почти пусты, их не проверить). Возвращается сводка по кадрам (feat_transform.summary_frames):
+её видят Инженер и Критик кода. CustomModel и fit_predict проверяются на подвыборке строк поиска.
 """
 
 import json
@@ -81,6 +84,34 @@ def _sample_frames(job, spec, data, splits, hints):
     return Xtr, ys[tr], frames, ys[va], keep_raw
 
 
+FRAME_NAMES = ["обучение", "валидация", "holdout", "test"]
+
+
+def _fold_frames(job, spec, data, splits, hints):
+    """Настоящий фолд на полных данных после принятой цепочки: (обучающая часть, её y, [валидация, holdout, test])."""
+    import numpy as np
+
+    import exp_runner
+    import feat_transform
+
+    config = job["config"]
+    X = exp_runner.build_features(config, data, spec, hints, Path(job["workdir"]))
+    n_train = data["n_train"]
+    Xs = X.iloc[:n_train].iloc[splits.search_idx].reset_index(drop=True)
+    ys = data["y_search"]
+    folds = splits.fold_array("full")
+    k = int(splits.eval_folds("full")[0])
+    tr = np.where((folds != k) & (folds >= 0))[0]
+    va = np.where(folds == k)[0]
+    Xh = X.iloc[:n_train].iloc[splits.holdout_idx].reset_index(drop=True)
+    Xte = X.iloc[n_train:].reset_index(drop=True)
+    keep_raw = set(spec.text_cols) | set(spec.datetime_cols)
+    chain = list(config.get("features", {}).get("chain", []) or [])
+    Xtr, frames = feat_transform.run_chain(chain, Path(job["workdir"]), Xs.iloc[tr].reset_index(drop=True), ys[tr],
+                                           [Xs.iloc[va].reset_index(drop=True), Xh, Xte], keep_raw)
+    return Xtr, ys[tr], frames, keep_raw
+
+
 def _child(job):
     import pickle
 
@@ -99,11 +130,12 @@ def _child(job):
         import exp_runner
         import feat_transform
 
-        Xtr, ytr, frames, _, keep_raw = _sample_frames(job, spec, data, splits, hints)
+        Xtr, ytr, frames, keep_raw = _fold_frames(job, spec, data, splits, hints)
         tr2, frames2 = feat_transform.apply(code, Xtr, ytr, frames, keep_raw)
         exp_runner.finish_frames([tr2] + list(frames2), job["config"], spec)
         return {"ok": True, "time_s": round(time.time() - t0, 2), "n_columns": int(tr2.shape[1]),
-                "describe": feat_transform.describe_diff(Xtr, tr2)}
+                "describe": feat_transform.describe_diff(Xtr, tr2),
+                "summary": feat_transform.summary_frames(Xtr, [tr2] + list(frames2), FRAME_NAMES)}
     if job["kind"] == "model":
         import eval_acceptance
         import exp_runner
@@ -138,7 +170,7 @@ def main():
     warnings.filterwarnings("ignore")
     sys.path.insert(0, str(HERE))
     t0 = time.time()
-    print(f"== песочница {job['kind']} {job['slot_id']} (подвыборка)", flush=True)
+    print(f"== песочница {job['kind']} {job['slot_id']}", flush=True)
     try:
         res = _child(job)
     except Exception as e:  # noqa: BLE001

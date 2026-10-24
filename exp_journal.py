@@ -79,7 +79,8 @@ class Journal:
         return (f"{r['node']} на {r.get('parent')}: {change} → {gain} [{r.get('status')}"
                 + (f": {_short(r.get('reason'), 80)}" if r.get("reason") else "") + "]"
                 + (f" (проверка {r['ref']})" if r.get("ref") else "")
-                + (f" — идея: {idea}" if r.get("change") and idea and idea != change else ""))
+                + (f" — идея: {idea}" if r.get("change") and idea and idea != change else "")
+                + _check_note(r))
 
     def stats(self) -> dict:
         st = {}
@@ -92,6 +93,14 @@ class Journal:
         ts = [r["time_s"] for r in self.records if r.get("family") == family and r.get("mode") == mode
               and r.get("time_s")]
         return float(np.median(ts)) if ts else None
+
+
+def _check_note(r) -> str:
+    """Замечания Критика кода, если они были: результат мог проверить не то, что просили."""
+    chk = r.get("code_check") or {}
+    if not chk.get("issues"):
+        return ""
+    return f" [Критик кода: {_short('; '.join(chk['issues']), 160)} → {_short(chk.get('verdict'), 80)}]"
 
 
 def _short(text, n=100):

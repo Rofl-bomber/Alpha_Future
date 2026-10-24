@@ -1,7 +1,8 @@
 # AI-агент для ML-задач — v3: анализ данных → L1 → поиск → финалисты
 
 Детерминированный харнесс считает метрику и решает «оставить / откатить»; LLM (Qwen3.8-27B)
-в ролях Аналитика, Исследователя и Инженера только предлагает. Критик — заглушка.
+в ролях Аналитика, Исследователя и Инженера только предлагает. Критик кода сверяет просьбу
+Исследователя, код Инженера и то, что код выдал на настоящем фолде; Критик скачков и финалистов — заглушка.
 
 ## Запуск
 
@@ -58,7 +59,8 @@ python bench/pack.py submission.zip
 - `AGENT_STAGE_PRE_FRAC`, `AGENT_STAGE_FEAT_FRAC`, `AGENT_STAGE_MODEL_FRAC`, `AGENT_PLATEAU_N` — подэтапы поиска;
 - `AGENT_ANALYSIS_STEPS`, `AGENT_ANALYSIS_STEP_TIMEOUT_S`, `AGENT_RECALL_STEPS`, `AGENT_RECALL_MINUTES` — Аналитик;
 - `AGENT_RESEARCHER_TOOL_STEPS`, `AGENT_ENGINEER_ATTEMPTS` — Исследователь и Инженер;
-- `AGENT_CRITIC_ENABLED=1` — включить настоящего Критика;
+- `AGENT_CRITIC_ENABLED=1` — включить настоящего Критика скачков и финалистов;
+- `AGENT_CODE_CRITIC=0` — выключить Критика кода (сверка просьбы, кода transform и сводки результата);
 - `AGENT_TOKEN_LIMIT_TOTAL`, `AGENT_TOKEN_LIMIT_ANALYST` — лимиты токенов (у Аналитика свой);
 - `AGENT_UNLIMITED=1` — без внутренних ограничений: только бюджет и границы фаз.
 

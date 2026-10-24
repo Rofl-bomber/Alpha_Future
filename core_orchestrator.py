@@ -483,6 +483,10 @@ class Orchestrator:
                        stop_reason=res.get("stop_reason"), budget_s=res.get("budget_s"))
             if not res.get("ok") and res.get("wall_s") and (res.get("timed_out") or "исчерпан" in str(res.get("error"))):
                 rec["time_s"] = res["wall_s"]  # прогон не уложился в бюджет — оценка времени семейства растёт
+        chk = hyp.get("code_check")
+        if chk:
+            rec["code_check"] = {"verdict": chk.get("verdict"), "issues": chk.get("issues"), "fixed": chk.get("fixed"),
+                                 "summary": (chk.get("summary") or "")[:4000]}
         if extra:
             rec.update(extra)
         self.journal.add(rec)
@@ -808,6 +812,8 @@ class Orchestrator:
             impl = self._implement(slot, slot_id, hyp, deadline)
             if not impl:
                 return
+            if impl.get("check"):
+                hyp = dict(hyp, code_check=impl["check"])
             if slot == "transform":
                 self.codes_desc[slot_id] = (hyp.get("spec") or desc)[:200]
                 patch = dict(patch, **{"features.chain": "+" + slot_id})

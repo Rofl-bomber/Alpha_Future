@@ -6,6 +6,11 @@
 исправление, не больше cfg.engineer_attempts попыток. Внутри слота свобода полная; харнесс
 проверяет только форму выхода.
 
+После успешного запуска transform Критик кода (cfg.code_critic) сверяет просьбу Исследователя, код и сводку
+того, что код выдал на настоящем фолде. Если есть замечания, Инженер получает их вместе со сводкой и одну
+попытку исправить или объяснить, что код верен. Права вето у Критика нет: дальше код идёт в эксперимент,
+замечания и итог проверки записываются в журнал (check).
+
 Любая неудача — ошибка запуска, ответ без кода, ответ, обрезанный по длине, ошибка или таймаут вызова
 LLM — это одна неудачная попытка внутри цикла; implement не бросает исключений. Если попытки кончились,
 возвращается {"ok": False, "error": ...}: оркестратор пишет в журнал «не реализовано» с причиной,
@@ -21,6 +26,7 @@ import pandas as pd
 import feat_sandbox
 import llm_client
 import llm_prompts
+import llm_roles
 
 log = logging.getLogger("agent")
 
@@ -132,14 +138,66 @@ class Engineer:
             timeout = self.cfg.sandbox_timeout_s if not self.cfg.unlimited else max(5.0, deadline - time.time())
             res = feat_sandbox.run(SANDBOX_KIND[slot], code, self.ctx, slot_id, config, timeout=timeout)
             if res.get("ok"):
+                code, res, check = self._review(slot, slot_id, hyp, config, code, res, messages, text, deadline,
+                                                n_rows)
                 self.ctx.p("codes", f"{slot_id}.py").write_text(code, encoding="utf-8")
-                return {"ok": True, "code": code, "result": res, "attempts": attempt}
+                return {"ok": True, "code": code, "result": res, "attempts": attempt, "check": check}
             err = _format_error(res)
             messages += [{"role": "assistant", "content": text[-6000:]},
                          {"role": "user", "content": llm_prompts.ENGINEER_FIX.format(error=err[-3500:])}]
             if len(messages) > 8:  # система, задача и 3 последних обмена
                 messages = messages[:2] + messages[-6:]
         return {"ok": False, "error": err, "attempts": attempt}
+
+    def _review(self, slot, slot_id, hyp, config, code, res, messages, text, deadline, n_rows):
+        """Критик кода и одна попытка исправления. Возвращает (код, результат песочницы, check)."""
+        summary = res.get("summary") or ""
+        check = {"summary": summary, "issues": [], "verdict": "не проверялся", "fixed": False}
+        if slot != "transform" or not self.cfg.code_critic or not summary:
+            return code, res, check
+        left = deadline - time.time()
+        if left < 30:
+            check["verdict"] = "не проверялся: не хватило времени"
+            return code, res, check
+        try:
+            v = llm_roles.code_critic(self.client, hyp, self._contract(slot, n_rows), code, summary, timeout=left)
+        except llm_client.LLMError as e:
+            check["verdict"] = f"Критик не ответил: {str(e)[:150]}"
+            return code, res, check
+        if v["ok"]:
+            check["verdict"] = "замечаний нет"
+            return code, res, check
+        check["issues"] = v["issues"][:8]
+        issues = "\n".join(f"- {x}" for x in check["issues"])
+        log.info("Критик кода %s: %s", slot_id, " | ".join(check["issues"])[:300])
+        msgs = messages + [{"role": "assistant", "content": text[-6000:]},
+                           {"role": "user", "content": llm_prompts.ENGINEER_REVIEW.format(summary=summary[:6000],
+                                                                                       issues=issues)}]
+        try:
+            r = self.client.chat_full(msgs, role="engineer", max_tokens=self.cfg.engineer_max_tokens,
+                                      thinking=None if self.cfg.engineer_thinking else False,
+                                      timeout=max(5.0, deadline - time.time()))
+        except llm_client.LLMError as e:
+            check["verdict"] = f"есть замечания; Инженер не ответил на них ({str(e)[:100]}) — оставлен исходный код"
+            return code, res, check
+        new = extract_code(r["text"], slot)
+        if not new:
+            why = "ответ оборвался" if r["finish"] == "length" else "в ответе нет кода"
+            check["verdict"] = f"есть замечания; {why} — оставлен исходный код"
+            return code, res, check
+        if new.strip() == code.strip():
+            note = " ".join(CODE_RE.sub("", r["text"]).split())[:300]
+            check["verdict"] = "есть замечания; Инженер считает код верным" + (f": {note}" if note else "")
+            return code, res, check
+        timeout = self.cfg.sandbox_timeout_s if not self.cfg.unlimited else max(5.0, deadline - time.time())
+        res2 = feat_sandbox.run(SANDBOX_KIND[slot], new, self.ctx, slot_id, config, timeout=timeout)
+        if not res2.get("ok"):
+            check["verdict"] = ("есть замечания; исправленный код не запустился — оставлен исходный: "
+                                + str(res2.get("error"))[:150])
+            return code, res, check
+        check.update(fixed=True, verdict="есть замечания; Инженер исправил код",
+                     summary=res2.get("summary") or summary)
+        return new, res2, check
 
 
 def format_result(res: dict) -> str:
