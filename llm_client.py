@@ -3,9 +3,10 @@
 Переменные окружения как в baseline.py: OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL.
 Ответ модели очищается от блоков размышлений. JSON: сначала response_format (если сервер
 умеет), затем извлечение блока, починка и проверка pydantic-схемой с повторным запросом.
-Если лимит токенов на прогон исчерпан — LLMBudgetExceeded, оркестратор переходит
-на детерминированные операторы. У Аналитика (анализ, сжатие отчёта, повторные вызовы) отдельный
-лимит token_limit_analyst. В режиме AGENT_UNLIMITED лимитов токенов нет.
+Лимиты токенов на прогон — у каждой группы ролей свои (ROLE_GROUP, cfg.token_limit_<группа> на вход + выход
+и у части групп cfg.token_limit_<группа>_out на выход): Аналитик, Исследователь, Инженер, Критик, прочие.
+Если лимит группы исчерпан — LLMBudgetExceeded для её ролей, остальные роли продолжают работать.
+В режиме AGENT_UNLIMITED лимитов токенов нет.
 """
 
 import ast
@@ -32,7 +33,8 @@ class LLMBudgetExceeded(LLMError):
 THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
-ANALYST_ROLES = ("analyst", "analyst_delta", "summarizer")
+ROLE_GROUP = {"analyst": "analyst", "analyst_delta": "analyst", "summarizer": "analyst",
+              "researcher": "researcher", "engineer": "engineer", "critic": "critic"}  # остальные — "other"
 
 
 def strip_think(text: str) -> str:
@@ -122,19 +124,19 @@ class LLMClient:
             self.total_in += pin
             self.total_out += pout
 
-    def _totals(self, analyst: bool):
+    def _totals(self, group: str):
         with self.lock:
-            rows = [u for r, u in self.usage.items() if (r in ANALYST_ROLES) == analyst]
+            rows = [u for r, u in self.usage.items() if ROLE_GROUP.get(r, "other") == group]
         return sum(u["in"] for u in rows), sum(u["out"] for u in rows)
 
     def budget_left(self, role: str | None = None) -> bool:
         if self.cfg.unlimited:
             return True
-        if role in ANALYST_ROLES:
-            pin, pout = self._totals(True)
-            return (pin + pout) < self.cfg.token_limit_analyst
-        pin, pout = self._totals(False)
-        return (pin + pout) < self.cfg.token_limit_total and pout < self.cfg.token_limit_out
+        group = ROLE_GROUP.get(role or "", "other")
+        pin, pout = self._totals(group)
+        total = getattr(self.cfg, f"token_limit_{group}")
+        out = getattr(self.cfg, f"token_limit_{group}_out", None)
+        return (pin + pout) < total and (out is None or pout < out)
 
     def _log(self, rec):
         try:

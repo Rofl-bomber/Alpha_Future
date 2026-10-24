@@ -147,12 +147,19 @@ class Config:
     llm_timeout_s: float = 300.0
     llm_retries: int = 3
     temperature: float = 0.3
-    token_limit_total: int = 3_000_000  # на один запуск всех ролей, кроме Аналитика (Исследователь с инструментами)
-    token_limit_out: int = 400_000
-    token_limit_analyst: int = 2_000_000  # отдельный лимит Аналитика (анализ + повторные вызовы)
+    # Лимиты токенов на прогон — у каждой роли свои (вход + выход; у части ролей ещё отдельно выход), чтобы
+    # одна роль не съедала бюджет другой. Размышления модели входят в выходные токены.
+    token_limit_analyst: int = 2_000_000  # Аналитик: анализ, сжатие отчёта, повторные вызовы
+    token_limit_researcher: int = 2_000_000
+    token_limit_researcher_out: int = 600_000
+    token_limit_engineer: int = 1_500_000
+    token_limit_engineer_out: int = 900_000
+    token_limit_critic: int = 800_000  # Критик кода (и Критик скачков и финалистов, если включён)
+    token_limit_critic_out: int = 300_000
+    token_limit_other: int = 300_000  # прочие роли (чтение TaskSpec)
     engineer_thinking: int = 0  # 0 — просить сервер отключить размышления у Инженера
     researcher_max_tokens: int = 30000
-    engineer_max_tokens: int = 15000
+    engineer_max_tokens: int = 32000  # размышления успешных ответов на сложных гипотезах — до ~13.5 тыс. токенов
 
     # Инженер и песочница
     engineer_attempts: int = 3  # попыток написать код, который проходит запуск на подвыборке

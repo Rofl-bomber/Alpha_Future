@@ -61,7 +61,9 @@ python bench/pack.py submission.zip
 - `AGENT_RESEARCHER_TOOL_STEPS`, `AGENT_ENGINEER_ATTEMPTS` — Исследователь и Инженер;
 - `AGENT_CRITIC_ENABLED=1` — включить настоящего Критика скачков и финалистов;
 - `AGENT_CODE_CRITIC=0` — выключить Критика кода (сверка просьбы, кода transform и сводки результата);
-- `AGENT_TOKEN_LIMIT_TOTAL`, `AGENT_TOKEN_LIMIT_ANALYST` — лимиты токенов (у Аналитика свой);
+- `AGENT_TOKEN_LIMIT_ANALYST`, `AGENT_TOKEN_LIMIT_RESEARCHER`, `AGENT_TOKEN_LIMIT_ENGINEER`,
+  `AGENT_TOKEN_LIMIT_CRITIC`, `AGENT_TOKEN_LIMIT_OTHER` — лимиты токенов на прогон по ролям (вход + выход);
+  `AGENT_TOKEN_LIMIT_RESEARCHER_OUT`, `AGENT_TOKEN_LIMIT_ENGINEER_OUT`, `AGENT_TOKEN_LIMIT_CRITIC_OUT` — на выход;
 - `AGENT_UNLIMITED=1` — без внутренних ограничений: только бюджет и границы фаз.
 
 ## Файлы прогона
