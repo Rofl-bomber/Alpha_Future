@@ -62,7 +62,7 @@ class Journal:
                 lines.append(f"  - [{r.get('stage')}] {r['node']}: {_short(r.get('change') or r.get('desc'), 120)} → "
                              + (f"{r['delta']:+.4g}" if isinstance(r.get("delta"), (int, float)) else r.get("status")))
         if errors:
-            lines.append("Не удалось выполнить:")
+            lines.append("Не реализовано или не выполнено (идея НЕ проверена, её можно предложить снова):")
             for r in errors:
                 lines.append(f"  - {r['node']}: {_short(r.get('desc'), 100)} → {r.get('status')}: "
                              f"{_short(r.get('reason') or r.get('error'), 160)}")

@@ -65,23 +65,56 @@ A wrong conclusion here (especially about validation) silently breaks everything
 6. Possible leakage: features that encode the target or the split (ids, row order, columns filled differently
    in train and test, columns computed after the outcome). Check ids and row order explicitly.
 
-# How to work
-- Start broad (shapes, types, train vs test comparison), then go deep where something is unusual.
-  The harness statistics in the first message already give per-column basics: do not recompute them.
-- Treat every observation as a hypothesis and test it with a query before relying on it.
-- If you build any rule to match or group rows (a key, a bucketing, a definition of "the same object"),
-  verify it: check that the columns you use are really stable for what they should identify, and compare
-  at least two alternative rules by how many rows they cover (in train and in test) and how consistent
-  the target is within the resulting groups. Report which rule you chose and why.
-- Do not reject an idea because you found counterexamples. Before concluding that something does not work or
-  cannot be used, measure how often the counterexamples occur and how strong the effect is on the remaining rows.
-  A pattern that holds for most rows is still a usable signal.
-- When a result is surprising or contradicts the description, investigate it instead of moving on.
-- Do NOT train or tune predictive models (no gradient boosting, sklearn estimators, cross-validation).
-  Use pandas / numpy queries and simple statistics.
-- Every conclusion must be backed by a number computed in this session. State the number.
-- Keep code small and fast; inspect large outputs with head(), value_counts(), describe().
-- Never modify train or test in place: work on copies (df = train.copy()).
+# Mandatory rules
+Every rule below is required. A report that skips any of them is incomplete: do not write Final until all of
+them are satisfied. Finishing before the step limit is fine only after these checks are done.
+
+1. Order of work. Start broad (shapes, types, train vs test comparison), then go deep where something is
+   unusual. The harness statistics in the first message already give per-column basics: do not recompute them.
+
+2. Evidence. Every observation is a hypothesis until a query in this session confirms it. Every conclusion in
+   the report must state the number, computed in this session, that supports it.
+
+3. Keys and groupings. For every rule that matches or groups rows (a key, a bucketing, a definition of
+   "the same object"), you must:
+   a. check that its columns are really stable for what they should identify;
+   b. build at least two alternative rules (for example, with fewer and with more columns);
+   c. report for each rule: coverage (share of train rows in groups of 2+ rows; share of test rows whose group
+      occurs in train), the spread of the target inside groups compared with the overall spread, and the share
+      of groups that contain conflicting rows (rows that clearly belong to different objects);
+   d. if the rows of one group occur in different periods or positions, measure how well the target of the
+      group's other rows predicts the target of a row: correlation, or the error of the simple estimate
+      "same as the other rows of this group" compared with the overall-mean estimate. This is the predictive
+      value of the dependency, and it decides whether the dependency matters. It is a measurement of the signal,
+      not a recipe for building a feature: how a feature is computed is decided by the components that build
+      the model;
+   e. state which rule you chose and why, with the numbers from c and d.
+
+4. Counterexamples. Never reject or downgrade an idea because counterexamples exist. Before concluding that
+   something does not work or cannot be used, measure (a) the share of rows affected by the counterexamples and
+   (b) the size of the effect on the remaining rows. Conclude "does not work" only if the effect on the
+   remaining rows is weak. A noisy rule that holds for most rows is still a usable signal: report it as such.
+
+5. Independence. You may state that rows are independent only after rule 3 was applied and no grouping showed a
+   target spread inside groups clearly smaller than the overall spread, and no predictive value in 3d.
+
+6. Contradictions. When a result is surprising, contradicts the description or an earlier finding, investigate
+   it with a query before moving on. Do not explain it away without a number.
+
+7. Findings, not implementations. Report what you found, what you measured and how. Do not prescribe how
+   features, encodings, target transforms or models must be implemented (formulas for building a feature, which
+   rows to include or exclude when computing it, model settings): the components that build the model know how
+   their results are used and decide that.
+
+8. No models. Do NOT train or tune predictive models (no gradient boosting, sklearn estimators,
+   cross-validation). Use pandas / numpy queries and simple statistics. Group means, medians and "value of the
+   same group in another period" are simple statistics, not models.
+
+9. Code. Keep code small and fast; inspect large outputs with head(), value_counts(), describe().
+   Never modify train or test in place: work on copies (df = train.copy()).
+
+Before writing Final, go through rules 2-7 and check that each is satisfied. If one is not, use the remaining
+steps to satisfy it.
 
 # Validation split (required, before the Final answer)
 Fix the split you recommend by calling the harness function that exists in the session:
@@ -107,7 +140,8 @@ Part A — text:
    training, what into validation, what share of validation rows has the same links to the training part as test
    rows have to train). If there are several options, compare them. Say which split you submitted.
 4. Target properties, data quality, train/test shift, leakage risks — with numbers.
-5. Hypotheses for features and modeling: for each, what to do and what evidence supports it. Do not rank them:
+5. Hypotheses for features and modeling: for each, the idea (what information could help the model) and the
+   evidence for it, without implementation details (rule 7). Do not rank them:
    their value will be measured by experiments at the next stage. If you have a simple non-model estimate of an
    effect, you may add it, but mark it as preliminary: simple estimates tend to underestimate complex features
    and interactions, so never use them to drop or downgrade an idea.
@@ -208,7 +242,10 @@ current solution for those rows), search_rows (positions of those rows in train)
 selection holdout: do not use their target), pd, np, and anything you created before (unless the session restarted).
 
 Rules: every conclusion is backed by a number computed now; do NOT train or tune predictive models; do not modify
-train or test in place.
+train or test in place. Report findings, not implementations: say what you found, what you measured and how, but do
+not prescribe how features, encodings or models must be implemented (formulas for building a feature, which rows to
+include or exclude when computing it): the components that build the model decide that. A measurement such as "the
+error of the estimate 'same as the other rows of this group'" shows the signal; it is not a recipe for a feature.
 
 Step format — each reply is exactly one of:
 1) Thought: <short>
@@ -290,6 +327,8 @@ How the search works:
 - If a point of the report contradicts what you see now, list it in "obsolete" with the reason.
 - "Tried and not accepted" shows what was applied to which solution and with what gain. Re-propose such an idea only
   if the current solution differs in a way that should change the outcome.
+  Entries listed there as not implemented or not run were NOT tested: the Engineer could not write the code or the
+  run failed. You may propose such an idea again, as it was or with a clearer or simpler spec.
 - "Lessons" are your own notes from earlier calls: read them first and return the revised list.
 
 {stage_text}
@@ -319,10 +358,18 @@ Action: propose
   Your answer for this call. You may use at most {tool_steps} python/read_report actions, then you must propose.
 
 Hypothesis kinds:
-- code: the Engineer writes transform(train_df, y_train, others) that may change, drop or add columns of the current
-  data and may use the target of the training part (learned on train_df / y_train, applied to every frame). The
-  harness calls it inside every fold, so target statistics computed this way do not leak. Give exact formulas,
-  columns, keys and edge cases in "spec". This is the main tool of the preprocessing and features stages.
+- code: the Engineer writes the transform slot of the harness. This is the main tool of the preprocessing and
+  features stages. Your "spec" must fit the contract below; give exact formulas, columns, keys and edge cases.
+{contract}
+  How the harness uses the result: inside every fold it calls transform with train_df = the training part of the
+  fold and others = the frames to predict (the validation part of the fold, the holdout, test). The model is then
+  TRAINED on the returned train_df with y_train and PREDICTS the returned frames of others. So the model learns how
+  each column relates to the target on the rows of train_df and applies that relation to the rows of others.
+  Principle for every column computed from the target (target statistics by key, the history of the same object,
+  ...): a row of train_df must get the column by the same procedure as a row of others gets it, i.e. from the target
+  of rows outside its own part. A statistic that includes the row's own target, or that excludes only that one row
+  (leave-one-out), still depends on the row's own target; rows of others have nothing like it, so the relation the
+  model learns does not hold where it predicts.
 - config: a patch of harness settings; allowed keys for this stage are listed below.
 - custom_model: (model stage only) a custom model class written by the Engineer; describe it in "spec".
 - fit_predict: (model stage only) a whole pipeline written by the Engineer, only if the harness pipeline does not fit.
@@ -442,6 +489,8 @@ ENGINEER_USER = """# Task
 """
 
 ENGINEER_FIX = "The sample run failed:\n{error}\nFix the code and reply with the full corrected ```python``` block."
+ENGINEER_CUT = ("Your previous answer was cut off by the length limit before any code block. Reply now with the full "
+                "```python``` block of the slot; keep the reasoning short.")
 
 # ====================================================================== Критик (по умолчанию — заглушка)
 

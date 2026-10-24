@@ -5,6 +5,11 @@
 (feat_sandbox): OK — код уходит в эксперимент; ошибка — traceback возвращается Инженеру на
 исправление, не больше cfg.engineer_attempts попыток. Внутри слота свобода полная; харнесс
 проверяет только форму выхода.
+
+Любая неудача — ошибка запуска, ответ без кода, ответ, обрезанный по длине, ошибка или таймаут вызова
+LLM — это одна неудачная попытка внутри цикла; implement не бросает исключений. Если попытки кончились,
+возвращается {"ok": False, "error": ...}: оркестратор пишет в журнал «не реализовано» с причиной,
+и Исследователь решает, предлагать ли гипотезу снова.
 """
 
 import logging
@@ -14,6 +19,7 @@ import time
 import pandas as pd
 
 import feat_sandbox
+import llm_client
 import llm_prompts
 
 log = logging.getLogger("agent")
@@ -95,16 +101,33 @@ class Engineer:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         thinking = None if self.cfg.engineer_thinking else False
         err = "нет попыток"
+        attempt = 0
         for attempt in range(1, self.cfg.engineer_attempts + 1):
             if time.time() > deadline:
-                return {"ok": False, "error": "время на реализацию вышло", "attempts": attempt - 1}
-            text = self.client.chat(messages, role="engineer", max_tokens=self.cfg.engineer_max_tokens,
-                                    thinking=thinking, timeout=max(5.0, deadline - time.time()))
+                return {"ok": False, "error": f"время на реализацию вышло; последняя ошибка: {err}",
+                        "attempts": attempt - 1}
+            try:
+                r = self.client.chat_full(messages, role="engineer", max_tokens=self.cfg.engineer_max_tokens,
+                                          thinking=thinking, timeout=max(5.0, deadline - time.time()))
+            except llm_client.LLMBudgetExceeded as e:
+                return {"ok": False, "error": f"LLM: {e}", "attempts": attempt}
+            except llm_client.LLMError as e:
+                err = f"вызов LLM не удался: {e}"
+                log.info("Инженер, попытка %d: %s", attempt, str(e)[:200])
+                if "нет времени" in str(e):
+                    return {"ok": False, "error": err, "attempts": attempt}
+                continue  # сообщения не меняются: следующая попытка — тот же запрос
+            text = r["text"]
             code = extract_code(text, slot)
             if not code:
-                err = "в ответе нет блока ```python``` с кодом"
-                messages += [{"role": "assistant", "content": text[-4000:]},
-                             {"role": "user", "content": "No ```python``` block found. Reply with the full code."}]
+                if r["finish"] == "length":
+                    err = f"ответ оборвался по лимиту длины ({r['out']} токенов) до блока кода"
+                    note = llm_prompts.ENGINEER_CUT
+                else:
+                    err = "в ответе нет блока ```python``` с кодом"
+                    note = "No ```python``` block found. Reply with the full code."
+                messages += [{"role": "assistant", "content": text[-4000:] or "(no answer text)"},
+                             {"role": "user", "content": note}]
                 continue
             timeout = self.cfg.sandbox_timeout_s if not self.cfg.unlimited else max(5.0, deadline - time.time())
             res = feat_sandbox.run(SANDBOX_KIND[slot], code, self.ctx, slot_id, config, timeout=timeout)
@@ -116,7 +139,7 @@ class Engineer:
                          {"role": "user", "content": llm_prompts.ENGINEER_FIX.format(error=err[-3500:])}]
             if len(messages) > 8:  # система, задача и 3 последних обмена
                 messages = messages[:2] + messages[-6:]
-        return {"ok": False, "error": err, "attempts": self.cfg.engineer_attempts}
+        return {"ok": False, "error": err, "attempts": attempt}
 
 
 def format_result(res: dict) -> str:

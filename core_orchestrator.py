@@ -639,10 +639,12 @@ class Orchestrator:
         stage = self.stage
         schema = search_operators.schema_text(self.spec, stage, self.hints)
         timeout = max(60.0, min(self.scheduler.stage_left(), self.timer.left("search")) - 10)
+        contract = self.engineer._contract("transform", len(self.data.X_all))  # тот же контракт, что видит Инженер
 
         def call():
             return llm_researcher.run(self.llm, self.kernel, self.cfg, stage, schema, ctx, self.reg.full_report,
-                                      timeout=timeout, log_path=self.workdir / "researcher_log.jsonl")
+                                      timeout=timeout, log_path=self.workdir / "researcher_log.jsonl",
+                                      contract=contract)
 
         self.research_stage = stage
         self.research_future = self.pool.submit(call)
@@ -825,21 +827,25 @@ class Orchestrator:
         return f"{prefix}_{self.slot_n:03d}"
 
     def _implement(self, slot, slot_id, hyp, deadline):
+        """Код Инженера для гипотезы. Неудача ничего не выбрасывает: в журнал пишется «не реализовано» с причиной,
+        подпись гипотезы снимается, чтобы Исследователь мог предложить её снова (как есть или уточнив), и неудача
+        не считается отклонением для плато подэтапа."""
         if not self.llm or not self.llm.available:
             return None
         try:
             res = self.engineer.implement(slot, slot_id, hyp, self._incumbent().config, self.columns_cur,
                                           self.reg.analyst_notes(hyp.get("ref")), deadline, len(self.data.X_all))
-        except llm_client.LLMError as e:
-            log.warning("Инженер недоступен: %s", str(e)[:200])
-            return None
+        except llm_client.LLMError as e:  # implement сам ловит ошибки LLM; это страховка
+            res = {"ok": False, "error": f"вызов LLM не удался: {e}"}
         if not res.get("ok"):
             parent = self._incumbent()
+            self.tried_sigs.discard(self._sig(hyp))
             node = self._new_node(parent.config, parent, "improve", (hyp.get("rationale") or "")[:200], None, hyp)
-            node.status, node.reason = "failed", "Инженер: " + str(res.get("error"))[:300]
+            node.status = "failed"
+            node.reason = (f"не реализовано Инженером ({res.get('attempts', 0)} попыток): "
+                           + str(res.get("error"))[:300])
             node.change = f"{slot}: {(hyp.get('spec') or hyp.get('rationale') or '')[:120]}"
             self._journal(node, "failed", mode="none", error=res.get("error"))
-            self.scheduler.feedback(False)
             log.info("Инженер не реализовал %s: %s", slot_id, str(res.get("error"))[:200])
             return None
         log.info("Инженер реализовал %s с попытки %d", slot_id, res.get("attempts", 1))

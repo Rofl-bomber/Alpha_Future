@@ -104,11 +104,12 @@ def parse_action(text: str) -> dict:
 
 
 def run(client, kernel, cfg, stage: str, schema: str, context: dict, full_report, timeout=None,
-        log_path=None) -> dict:
+        log_path=None, contract: str = "") -> dict:
     """Один вызов Исследователя. Возвращает {hypotheses, lessons, obsolete, stage}; LLMError — наружу."""
     system = llm_prompts.RESEARCHER_SYSTEM.format(stage_text=llm_prompts.STAGE_TEXT[stage],
                                                   max_out=cfg.analysis_max_out, tool_steps=cfg.researcher_tool_steps,
-                                                  schema=schema, stage=stage, n=cfg.researcher_hypotheses)
+                                                  schema=schema, stage=stage, n=cfg.researcher_hypotheses,
+                                                  contract=_indent(contract))
     user = llm_prompts.RESEARCHER_USER.format(stage=stage, **context)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     t_end = time.time() + timeout if timeout else None
@@ -163,6 +164,10 @@ def run(client, kernel, cfg, stage: str, schema: str, context: dict, full_report
             obs += "\n\n" + llm_prompts.RESEARCHER_LIMIT
         messages += [{"role": "assistant", "content": text[-6000:]}, {"role": "user", "content": obs}]
     raise llm_client.LLMError("Исследователь не прислал propose")
+
+
+def _indent(text: str, pad: str = "    ") -> str:
+    return "\n".join(pad + line if line.strip() else line for line in (text or "").splitlines())
 
 
 def _write(path, rec):

@@ -103,6 +103,7 @@ class LLMClient:
         self.total_out = 0
         self.json_mode_ok = None
         self.thinking_ctrl_ok = None
+        self.speeds = []  # токенов в секунду по успешным вызовам: из этого считается таймаут под max_tokens
         cache = os.environ.get("AGENT_LLM_CACHE")
         self.cache_dir = Path(cache) if cache else None
         if self.cache_dir:
@@ -143,22 +144,48 @@ class LLMClient:
             pass
 
     # ------------------------------------------------------------------ вызовы
-    def _time_left(self, timeout):
-        """Сколько секунд можно ждать ответа. В режиме без ограничений — до дедлайна вызывающей стороны."""
-        t_left = float("inf") if self.cfg.unlimited else self.cfg.llm_timeout_s
+    def _limits(self, timeout, max_tokens):
+        """(сколько секунд ждать ответа, max_tokens для запроса).
+
+        Ожидание — не меньше времени, нужного на max_tokens при измеренной скорости генерации, но не дольше
+        дедлайна вызывающей стороны. Если времени до дедлайна на max_tokens не хватает, max_tokens уменьшается
+        до того, что успеет сгенерироваться (иначе запрос заведомо закончится таймаутом).
+        """
+        speed = self._speed()
+        need = (max_tokens / speed) if (speed and max_tokens) else 0.0
+        t_left = float("inf") if self.cfg.unlimited else max(self.cfg.llm_timeout_s, need)
+        cap = float("inf")
         if self.deadline_fn:
-            t_left = min(t_left, self.deadline_fn() - time.time())
+            cap = min(cap, self.deadline_fn() - time.time())
         if timeout:
-            t_left = min(t_left, timeout)
-        return t_left
+            cap = min(cap, timeout)
+        t_left = min(t_left, cap)
+        if speed and max_tokens and need > t_left > 0:
+            max_tokens = max(256, int(speed * t_left * 0.9))
+        return t_left, max_tokens
 
     def chat(self, messages, role: str, max_tokens: int | None = 4000, temperature=None, json_mode=False,
              thinking=None, timeout=None, strip: bool = True) -> str:
-        """Один ответ модели.
+        """Текст ответа модели (может быть пустым или обрезанным по длине — см. chat_full)."""
+        return self.chat_full(messages, role, max_tokens=max_tokens, temperature=temperature, json_mode=json_mode,
+                              thinking=thinking, timeout=timeout, strip=strip)["text"]
 
-        Сетевые и серверные ошибки — до cfg.llm_retries попыток с паузой. Если ответ обрезан по длине
-        (finish_reason="length") или пуст, делается ровно один повтор: без размышлений и, если лимит
-        длины задан, с удвоенным max_tokens. В режиме AGENT_UNLIMITED max_tokens не передаётся.
+    def _speed(self):
+        """Медианная скорость генерации (токенов в секунду) по последним успешным вызовам; None — ещё не измерена."""
+        with self.lock:
+            v = list(self.speeds[-20:])
+        return float(sorted(v)[len(v) // 2]) if v else None
+
+    def chat_full(self, messages, role: str, max_tokens: int | None = 4000, temperature=None, json_mode=False,
+                  thinking=None, timeout=None, strip: bool = True) -> dict:
+        """Один ответ модели: {"text", "finish", "out"}.
+
+        Сетевые и серверные ошибки — до cfg.llm_retries попыток с паузой. Таймаут ответа не повторяется:
+        тот же запрос снова не уложится. Таймаут вызова не меньше времени, нужного на max_tokens при
+        измеренной скорости генерации; если столько времени у вызывающей стороны нет, max_tokens
+        уменьшается до того, что успеет сгенерироваться. Обрезанный по длине или пустой ответ возвращается
+        как есть (finish="length"): что с ним делать, решает вызывающая роль. В режиме AGENT_UNLIMITED
+        max_tokens не передаётся.
         """
         if not self.available:
             raise LLMError("LLM не настроена: нет OPENAI_MODEL или OPENAI_API_KEY")
@@ -173,17 +200,16 @@ class LLMClient:
                                             ensure_ascii=False).encode()).hexdigest()
             hit = self.cache_dir / f"{key}.json"
             if hit.exists():
-                return json.loads(hit.read_text(encoding="utf-8"))["text"]
+                return {"text": json.loads(hit.read_text(encoding="utf-8"))["text"], "finish": "stop", "out": 0}
         last_err = None
         errors = 0
-        short_retry_done = False  # единственный повтор для обрезанного или пустого ответа
         while True:
-            t_left = self._time_left(timeout)
+            t_left, mt = self._limits(timeout, max_tokens)
             if t_left < 5:
                 raise LLMError((last_err + "; " if last_err else "") + "нет времени на вызов LLM")
             kwargs = dict(model=self.model, messages=messages, temperature=temperature)
-            if max_tokens:
-                kwargs["max_tokens"] = int(max_tokens)
+            if mt:
+                kwargs["max_tokens"] = int(mt)
             extra = {}
             if json_mode and self.json_mode_ok is not False:
                 kwargs["response_format"] = {"type": "json_object"}
@@ -203,7 +229,7 @@ class LLMClient:
                 last_err = f"{name}: {str(e)[:300]}"
                 self._account(role, 0, 0, dt, ok=False)
                 self._log({"t": round(t0, 1), "role": role, "dt": round(dt, 1), "error": last_err,
-                           "max_tokens": max_tokens, "thinking": thinking})
+                           "max_tokens": mt, "timeout_s": timeout_s, "thinking": thinking})
                 if name == "BadRequestError":
                     changed = False
                     if "response_format" in kwargs and self.json_mode_ok is not True:
@@ -215,7 +241,7 @@ class LLMClient:
                     if changed:
                         continue
                     raise LLMError(last_err)
-                if name in ("AuthenticationError", "PermissionDeniedError", "NotFoundError"):
+                if name in ("AuthenticationError", "PermissionDeniedError", "NotFoundError", "APITimeoutError"):
                     raise LLMError(last_err)
                 errors += 1
                 if errors >= self.cfg.llm_retries:
@@ -233,33 +259,35 @@ class LLMClient:
             raw = msg.content or ""
             text = strip_think(raw) if strip else strip_paired_think(raw)
             reasoning = getattr(msg, "reasoning_content", None) or ""
+            if not reasoning and "</think>" in raw:  # размышления пришли внутри content
+                reasoning = raw.split("</think>")[0].replace("<think>", "")
             usage = getattr(resp, "usage", None)
             pin = getattr(usage, "prompt_tokens", 0) or 0
             pout = getattr(usage, "completion_tokens", 0) or 0
             details = getattr(usage, "completion_tokens_details", None)
             r_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
             self._account(role, pin, pout, dt)
-            self._log({"t": round(t0, 1), "role": role, "dt": round(dt, 1), "in": pin, "out": pout,
-                       "reasoning_tokens": r_tokens, "reasoning_chars": len(reasoning) + (len(raw) - len(text)),
-                       "finish_reason": finish, "max_tokens": max_tokens, "thinking": thinking,
-                       "prompt_tail": messages[-1]["content"][-1500:], "response": text[:6000]})
-            truncated = finish == "length"
-            if (truncated or not text) and not short_retry_done:
-                short_retry_done = True
-                why = "обрезан по длине" if truncated else "пустой"
-                log.warning("LLM (%s): ответ %s (out=%d, finish_reason=%s) — один повтор без размышлений%s",
-                            role, why, pout, finish, f", max_tokens={2 * max_tokens}" if max_tokens else "")
-                thinking = False
-                if max_tokens:
-                    max_tokens = 2 * int(max_tokens)
-                last_err = f"ответ {why} (finish_reason={finish})"
-                continue
-            if not text:
-                raise LLMError(f"пустой ответ после повтора (finish_reason={finish}, out={pout})")
-            if key:
+            if pout >= 200 and dt > 0:
+                with self.lock:
+                    self.speeds.append(pout / dt)
+            rec = {"t": round(t0, 1), "role": role, "dt": round(dt, 1), "in": pin, "out": pout,
+                   "reasoning_tokens": r_tokens, "reasoning_chars": len(reasoning) + (len(raw) - len(text)),
+                   "finish_reason": finish, "max_tokens": mt, "timeout_s": timeout_s, "thinking": thinking,
+                   "prompt_tail": messages[-1]["content"][-1500:], "response": text[:6000]}
+            if reasoning:  # начало и конец размышлений — для разбора случаев, когда ответа нет или он странный
+                rec["reasoning_head"] = reasoning[:2000]
+                if len(reasoning) > 4000:
+                    rec["reasoning_tail"] = reasoning[-2000:]
+                elif len(reasoning) > 2000:
+                    rec["reasoning_tail"] = reasoning[2000:]
+            self._log(rec)
+            if finish == "length" or not text:
+                log.warning("LLM (%s): ответ %s (out=%d, finish_reason=%s, max_tokens=%s)", role,
+                            "обрезан по длине" if finish == "length" else "пустой", pout, finish, mt)
+            elif key:
                 (self.cache_dir / f"{key}.json").write_text(json.dumps({"text": text}, ensure_ascii=False),
                                                             encoding="utf-8")
-            return text
+            return {"text": text, "finish": finish, "out": pout}
 
     def chat_json(self, messages, role: str, schema=None, max_tokens: int | None = 4000, retries: int = 2,
                   thinking=None, timeout=None):
