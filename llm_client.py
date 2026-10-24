@@ -216,9 +216,10 @@ class LLMClient:
             if json_mode and self.json_mode_ok is not False:
                 kwargs["response_format"] = {"type": "json_object"}
             if thinking is False and self.thinking_ctrl_ok is not False:
-                # vLLM/SGLang читают chat_template_kwargs, часть облачных провайдеров — enable_thinking
-                extra["chat_template_kwargs"] = {"enable_thinking": False}
-                extra["enable_thinking"] = False
+                # выключение размышлений Qwen у разных серверов:
+                extra["chat_template_kwargs"] = {"enable_thinking": False}  # vLLM / SGLang / большинство хостингов
+                extra["enable_thinking"] = False  # Qwen Cloud (DashScope) ждёт флаг на верхнем уровне
+                extra["reasoning"] = {"enabled": False}  # OpenRouter и похожие агрегаторы
             if extra:
                 kwargs["extra_body"] = extra
             t0 = time.time()
