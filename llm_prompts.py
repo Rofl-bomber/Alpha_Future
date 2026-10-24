@@ -226,6 +226,30 @@ SHORT_USER = """# Report (Part A)
 {report}
 """
 
+# ====================================================================== как построены данные текущего решения
+
+DATA_NOTE_COMMON = """How the data of the current solution is built:
+- cur_train: the search rows. Their features come from the chain of accepted transforms fitted on the search
+  rows, the same way as inside the folds: features that use the target are computed for each row without its own
+  part. Holdout rows did not take part in this chain.
+- oof: out-of-fold predictions of the current solution for the search rows."""
+
+DATA_NOTE_TEST_FULL = """- cur_test: the test rows. Their features come from the chain fitted on ALL train rows (search + holdout),
+  the way the final model sees them after it is refit on the whole train.
+So coverage, missing values and distributions of features in cur_test are those the final model will see. When
+you compare cur_train with cur_test, remember that their chains were fitted on different numbers of rows: for test,
+features that depend on the number of observations (counts, coverage of groups) are systematically larger; this is
+not an error of a transform."""
+
+DATA_NOTE_TEST_SEARCH = """- cur_test: the test rows. Their features come from the same chain fitted on the search rows only. The final
+model is refit on all train rows (search + holdout), so on test it will have higher coverage of groups and larger
+values of features that depend on the number of observations than cur_test shows."""
+
+
+def data_note(test_full: bool) -> str:
+    return DATA_NOTE_COMMON + "\n" + (DATA_NOTE_TEST_FULL if test_full else DATA_NOTE_TEST_SEARCH)
+
+
 # ====================================================================== Аналитик: повторный вызов (дельта)
 
 DELTA_SYSTEM = """You are the Analyst in an autonomous machine learning system, called again during the search.
@@ -241,8 +265,13 @@ of y_search), y_search (their target; class indices for classification), oof (ou
 current solution for those rows), search_rows (positions of those rows in train), holdout_rows (rows of the
 selection holdout: do not use their target), pd, np, and anything you created before (unless the session restarted).
 
+{data_note}
+
 Rules: every conclusion is backed by a number computed now; do NOT train or tune predictive models; do not modify
-train or test in place. Report findings, not implementations: say what you found, what you measured and how, but do
+train or test in place. Contradictions: when a result is surprising or contradicts an earlier finding, your earlier
+numbers, the description of how the data in the session is built, or the experiment results, investigate it with a
+query before drawing a conclusion. If you cannot explain it, report it as an open question with the numbers, not as
+a finding. Report findings, not implementations: say what you found, what you measured and how, but do
 not prescribe how features, encodings or models must be implemented (formulas for building a feature, which rows to
 include or exclude when computing it): the components that build the model decide that. A measurement such as "the
 error of the estimate 'same as the other rows of this group'" shows the signal; it is not a recipe for a feature.
@@ -345,6 +374,7 @@ Action: python
   solution for those rows), search_rows (positions of those rows in train), holdout_rows (selection holdout: do not
   use their target), pd, np. Use print(); output longer than {max_out} characters is truncated. Error analysis of
   the current solution is done here. Do not train heavy models here.
+{data_note}
 
 Thought: <short>
 Action: read_report

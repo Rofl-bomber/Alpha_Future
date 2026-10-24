@@ -109,7 +109,8 @@ def run(client, kernel, cfg, stage: str, schema: str, context: dict, full_report
     system = llm_prompts.RESEARCHER_SYSTEM.format(stage_text=llm_prompts.STAGE_TEXT[stage],
                                                   max_out=cfg.analysis_max_out, tool_steps=cfg.researcher_tool_steps,
                                                   schema=schema, stage=stage, n=cfg.researcher_hypotheses,
-                                                  contract=_indent(contract))
+                                                  contract=_indent(contract),
+                                                  data_note=_indent(llm_prompts.data_note(cfg.cur_test_full), "  "))
     user = llm_prompts.RESEARCHER_USER.format(stage=stage, **context)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     t_end = time.time() + timeout if timeout else None

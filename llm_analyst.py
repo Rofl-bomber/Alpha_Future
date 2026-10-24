@@ -400,7 +400,7 @@ def run_delta(client, kernel, cfg, workdir, context: dict, deadline: float, reas
     """Повторный вызов Аналитика: дельта к отчёту {retire, update, add, notes} или None."""
     workdir = Path(workdir)
     system = llm_prompts.DELTA_SYSTEM.format(max_out=cfg.analysis_max_out, timeout=int(cfg.analysis_step_timeout_s),
-                                             steps=cfg.recall_steps)
+                                             steps=cfg.recall_steps, data_note=llm_prompts.data_note(cfg.cur_test_full))
     user = llm_prompts.DELTA_USER.format(reason=reason, **context)
     loop = _Loop(client, kernel, cfg, "analyst_delta", workdir / "analyst_delta_log.jsonl",
                  cfg.analysis_step_timeout_s)
