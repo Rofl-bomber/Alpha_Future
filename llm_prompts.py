@@ -423,7 +423,8 @@ RESEARCHER_BAD_JSON = "The propose JSON could not be read: {error}. Reply with '
 
 ENGINEER_SYSTEM = """You are the Engineer in an autonomous ML agent. You implement ONE hypothesis as code for a fixed slot of
 the harness. Reply with a short 'Thought:' line and ONE ```python``` block with the full code of the slot.
-The harness runs the code on a sample first; if it fails you get the error and fix it (at most {attempts} attempts).
+The harness first runs the code (transform: on a real fold with full data; a model: on a sample); if it fails you
+get the error and fix it (at most {attempts} attempts).
 Keep the code vectorized and deterministic; no file or network access, no prints needed.
 
 {contract}"""
@@ -486,9 +487,18 @@ ENGINEER_USER = """# Task
 
 # Columns of the current data (name [kind] missing; values)
 {columns}
+
+# How train_df and others are formed
+{folds}
+
+# Accepted transforms of the current solution (they run before your code, in this order)
+{chain}
+
+# Sample rows of the current data (train_df before your code, transposed: one column per row)
+{sample}
 """
 
-ENGINEER_FIX = "The sample run failed:\n{error}\nFix the code and reply with the full corrected ```python``` block."
+ENGINEER_FIX = "The test run failed:\n{error}\nFix the code and reply with the full corrected ```python``` block."
 ENGINEER_CUT = ("Your previous answer was cut off by the length limit before any code block. Reply now with the full "
                 "```python``` block of the slot; keep the reasoning short.")
 ENGINEER_REVIEW = """The code ran on a real fold. What it produced (per new or changed column: statistics on the training

@@ -80,6 +80,17 @@ def columns_text(df: pd.DataFrame, spec, limit: int = 150) -> str:
     return "\n".join(lines)
 
 
+def sample_text(df: pd.DataFrame, n: int = 5, limit: int = 6000) -> str:
+    """Несколько строк данных, транспонированно (колонка — строка таблицы), чтобы влезли все колонки."""
+    if df is None or not len(df):
+        return "нет данных"
+    rows = df.sample(min(n, len(df)), random_state=0)
+    with pd.option_context("display.max_rows", 500, "display.max_columns", 20, "display.width", 200,
+                           "display.max_colwidth", 30):
+        text = rows.T.to_string()
+    return text if len(text) <= limit else text[:limit] + "\n... (сокращено)"
+
+
 class Engineer:
     def __init__(self, client, ctx, spec, task_text: str):
         self.client = client
@@ -97,13 +108,17 @@ class Engineer:
         return llm_prompts.CONTRACT_ESCAPE.format(n_jobs=self.cfg.n_jobs)
 
     def implement(self, slot: str, slot_id: str, hypothesis: dict, config: dict, columns: str, analyst: str,
-                  deadline: float, n_rows: int) -> dict:
+                  deadline: float, n_rows: int, context: dict | None = None) -> dict:
+        """context: folds — как формируются train_df и others; chain — код принятых transform; sample — строки данных."""
         system = llm_prompts.ENGINEER_SYSTEM.format(attempts=self.cfg.engineer_attempts,
                                                     contract=self._contract(slot, n_rows))
         hyp = (f"{hypothesis.get('rationale', '')}\n\nСпецификация: {hypothesis.get('spec', '')}"
                f"\nОжидаемый эффект: {hypothesis.get('expected', '')}")
+        context = context or {}
         user = llm_prompts.ENGINEER_USER.format(task=self.task_text, hypothesis=hyp, analyst=analyst or "нет",
-                                                columns=columns[:12000])
+                                                columns=columns[:12000], folds=context.get("folds") or "нет данных",
+                                                chain=context.get("chain") or "нет",
+                                                sample=context.get("sample") or "нет данных")
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         thinking = None if self.cfg.engineer_thinking else False
         err = "нет попыток"

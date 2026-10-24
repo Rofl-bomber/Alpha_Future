@@ -127,6 +127,7 @@ class Orchestrator:
         self.insurance = None  # {"thread", "result", "ctx"}
         self.dataset_text = "Текущий датасет ещё не построен."
         self.columns_cur = ""
+        self.sample_cur = ""  # несколько строк текущих данных — Инженеру
         self.journal = None
 
     # ================================================================== точка входа
@@ -435,6 +436,7 @@ class Orchestrator:
             self.dataset_text = task_profiler.current_stats(tr, te, list(self.spec.feature_cols),
                                                             node.result.get("importance"))
             self.columns_cur = llm_engineer.columns_text(tr, self.spec)
+            self.sample_cur = llm_engineer.sample_text(tr)
             (self.workdir / "dataset_current.txt").write_text(self.dataset_text, encoding="utf-8")
             if self.kernel is not None:
                 pos = np.where(self.raw_valid)[0]
@@ -840,7 +842,8 @@ class Orchestrator:
             return None
         try:
             res = self.engineer.implement(slot, slot_id, hyp, self._incumbent().config, self.columns_cur,
-                                          self.reg.analyst_notes(hyp.get("ref")), deadline, len(self.data.X_all))
+                                          self.reg.analyst_notes(hyp.get("ref")), deadline, len(self.data.X_all),
+                                          context=self._engineer_context(slot))
         except llm_client.LLMError as e:  # implement сам ловит ошибки LLM; это страховка
             res = {"ok": False, "error": f"вызов LLM не удался: {e}"}
         if not res.get("ok"):
@@ -856,6 +859,50 @@ class Orchestrator:
             return None
         log.info("Инженер реализовал %s с попытки %d", slot_id, res.get("attempts", 1))
         return res
+
+    def _engineer_context(self, slot) -> dict:
+        """Что Инженеру нужно знать, чтобы не гадать: как формируются кадры, код принятых transform, строки данных."""
+        if slot == "escape":
+            return {"folds": self._folds_text(), "chain": "не используется: fit_predict получает сырые данные",
+                    "sample": "нет: fit_predict получает сырые данные"}
+        return {"folds": self._folds_text(), "chain": self._chain_code_text(), "sample": self.sample_cur}
+
+    def _folds_text(self) -> str:
+        sp = self.splits
+        kind = sp.scheme.split(":")[-1]
+        lines = [f"Scheme: {sp.describe()}. Test: {len(self.data.X_all) - self.data.n_train} rows.",
+                 "In every experiment, for each fold k: train_df = the search rows of all other folds, y_train = their "
+                 "target; others = [the rows of fold k (validation), all holdout rows, all test rows]."]
+        if kind == "ordered" and sp.group_col:
+            lines.append(f"Folds are periods of {sp.group_col} (a period or a run of consecutive periods per fold): "
+                         "train_df contains periods both before and after the validation period.")
+        elif kind == "group" and sp.group_col:
+            lines.append(f"Folds are groups by {sp.group_col}: a group is never split between train_df and the "
+                         "validation part.")
+        lines.append("For the final model transform is called once more with train_df = all train rows (search + "
+                     "holdout) and others = [test rows].")
+        return "\n".join(lines)
+
+    def _chain_code_text(self, limit: int = 16000) -> str:
+        """Код принятых transform по порядку; если не помещается — старые сокращаются первыми."""
+        chain = list(self._incumbent().config.get("features", {}).get("chain", []) or [])
+        if not chain:
+            return "нет: это первый transform"
+        parts = []
+        for tid in chain:
+            try:
+                code = (self.workdir / "codes" / f"{tid}.py").read_text(encoding="utf-8")
+            except OSError:
+                code = "(код не найден)"
+            parts.append([tid, (self.codes_desc.get(tid) or "")[:200], code])
+        total = sum(len(c) for _, _, c in parts)
+        for p in parts[:-1]:
+            if total <= limit:
+                break
+            cut = p[2][:600] + "\n# ... (сокращено)"
+            total -= len(p[2]) - len(cut)
+            p[2] = cut
+        return "\n\n".join(f"## {tid}: {desc}\n```python\n{code}\n```" for tid, desc, code in parts)
 
     # ------------------------------------------------------------------ оценка узла
     def _screen_of(self, node):
