@@ -422,11 +422,28 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ текущие данные решения (D3)
     def _refresh_current(self, node):
-        """Текущие данные решения: цепочка на строках поиска → статистика D3, данные в сессию, колонки Инженеру."""
+        """Текущие данные решения → статистика D3, данные в сессию, колонки и строки Инженеру.
+
+        cur_train — цепочка на строках поиска; cur_test — цепочка на всех строках train (AGENT_CUR_TEST_FULL),
+        как при финальном переобучении, иначе тоже на строках поиска."""
         out_dir = self.workdir / "current"
-        res = exp_runner.run_job({"kind": "materialize", "config": node.config, "out_dir": str(out_dir)}, self.ctx,
-                                 timeout=self._budget("search", max(60.0, min(600.0, 0.1 * self.timer.left("search")))),
-                                 tag=f"{node.id}_materialize")
+        job = {"kind": "materialize", "config": node.config, "out_dir": str(out_dir)}
+        y_path = None
+        if self.cfg.cur_test_full and len(self.splits.holdout_idx):
+            # метки holdout — только дочернему процессу, файл удаляется сразу после построения
+            y_path = self.ctx.p("jobs", f"{node.id}_materialize_yh.npy")
+            np.save(y_path, self.vault.labels_for_features())
+            job["y_holdout_path"] = str(y_path)
+        try:
+            res = exp_runner.run_job(job, self.ctx,
+                                     timeout=self._budget("search", max(60.0, min(600.0, 0.1 * self.timer.left("search")))),
+                                     tag=f"{node.id}_materialize")
+        finally:
+            if y_path is not None:
+                try:
+                    y_path.unlink()
+                except OSError:
+                    pass
         if not res.get("ok"):
             log.warning("текущие данные решения не построены: %s", str(res.get("error"))[:300])
             return

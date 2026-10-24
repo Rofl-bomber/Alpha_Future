@@ -139,6 +139,9 @@ class Config:
     max_queue: int = 12
     researcher_tool_steps: int = 8  # инструментальных шагов (python, read_report) на один вызов Исследователя
     researcher_hypotheses: int = 4
+    # cur_test (данные теста в сессии ролей) строится цепочкой на всех строках train, как при финальном
+    # переобучении; 0 — цепочкой на строках поиска (как cur_train)
+    cur_test_full: bool = True
     critic_enabled: bool = False  # Критик скачков и финалистов — заглушка: всегда «принять» и «никого не исключать»
     code_critic: bool = True  # Критик кода: сверка просьбы, кода transform и сводки результата; одна попытка исправить
     critic_max_tokens: int = 16000

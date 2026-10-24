@@ -801,7 +801,12 @@ def _refit(job):
 
 
 def _materialize(job):
-    """Текущие данные решения (D3): цепочка на всех строках поиска → cur_train (строки поиска) и cur_test."""
+    """Текущие данные решения (D3).
+
+    cur_train — строки поиска после цепочки, обученной на строках поиска (как внутри фолдов). cur_test — test
+    после цепочки, обученной на всех строках train (поиск + holdout), как при финальном переобучении, если
+    передан y_holdout_path (AGENT_CUR_TEST_FULL); иначе — той же цепочкой на строках поиска.
+    """
     spec, data, splits, hints = _load(job)
     config = job["config"]
     workdir = Path(job["workdir"])
@@ -810,6 +815,11 @@ def _materialize(job):
     Xs = X.iloc[:n_train].iloc[splits.search_idx].reset_index(drop=True)
     Xte = X.iloc[n_train:].reset_index(drop=True)
     tr, (te,) = prepare_fold(config, spec, workdir, Xs, data["y_search"], [Xte])
+    if job.get("y_holdout_path"):
+        idx = np.concatenate([splits.search_idx, splits.holdout_idx])
+        Xl = X.iloc[:n_train].iloc[idx].reset_index(drop=True)
+        yl = np.concatenate([data["y_search"], np.load(job["y_holdout_path"])], axis=0)
+        _, (te,) = prepare_fold(config, spec, workdir, Xl, yl, [Xte])
     out = Path(job["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     tr.to_pickle(out / "cur_train.pkl")
