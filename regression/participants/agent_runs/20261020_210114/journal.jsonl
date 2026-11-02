@@ -1,5 +1,0 @@
-{"ts": 1792519279.31, "status": "baseline", "exp_id": "e001", "model": "lightgbm", "config": {"preprocess": {"cat_encoding": "native", "missing_flags": false, "rare_min_count": 0}, "features": {"builtin": [], "custom": [], "drop": [], "group_by": [], "group_cols": []}, "target": {"transform": "none"}, "model": {"name": "lightgbm", "params": {}}, "postprocess": {"class_weights_opt": false, "clip_to_train_range": true}}, "fold_scores": [56.529595, 50.971932, 46.050566, 39.808107, 47.217347], "score": 48.1155094, "raw_score": 48.115798296916665, "oof_score": 48.43253195126089, "pp_params": {"clip": [1.105773197, 975.4523213]}, "time_s": 4.1, "error": null, "reused_from": null, "n_features": 62, "iter": 0}
-{"ts": 1792519342.09, "status": "event", "event": "researcher_failed", "iter": 1}
-{"ts": 1792519397.15, "status": "event", "event": "researcher_failed", "iter": 2}
-{"ts": 1792519451.85, "status": "event", "event": "researcher_failed", "iter": 3}
-{"ts": 1792519451.87, "status": "event", "event": "final", "choice": "e001", "reason": "кандидат один", "score": null, "final_score": 48.1155094, "blend_score": null, "best_single": "e001"}
